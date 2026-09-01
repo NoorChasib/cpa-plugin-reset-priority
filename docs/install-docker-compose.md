@@ -175,7 +175,7 @@ curl --fail --silent --show-error -X POST \
   http://127.0.0.1:8317/v0/management/plugins/reset-priority/refresh
 ```
 
-The HTML resource route is read-only, unauthenticated, and intentionally contains no account-level status. Use the authenticated management status route for dry-run validation; do not expose the management key in screenshots or shell transcripts.
+The resource route is read-only, unauthenticated, and intentionally contains no account-level status. Use the authenticated management status routes for dry-run validation — JSON at `/v0/management/plugins/reset-priority/status`, or the browser HTML view at `/v0/management/plugins/reset-priority/status/html` (same management authentication; includes a Refresh now action and shows only sanitized fields with file-name or redacted identifiers). At the audited CPA revision, management authentication is header-only, so ordinary address-bar navigation and query parameters cannot authenticate the HTML route; use a browser/profile or authenticated reverse proxy that supplies the management header to both GET and POST requests. Physical filenames can be identifying. Do not expose filenames, the management key, or private status data in screenshots or shell transcripts.
 
 ## Dry-run-first validation
 
@@ -188,6 +188,8 @@ Inspect authenticated `GET /v0/management/plugins/reset-priority/status` and kee
 5. disabled/reauth-required/recovering accounts are at `0` and excluded from the healthy count;
 6. quota, 429, cooldown, and ordinary unavailability do not create quarantine;
 7. exact timestamps and the next deadline timer are plausible.
+
+Note that dry-run suppresses all writes, so the quarantine sentinel `0` appears in status only. Once `dry-run: false`, the sentinel is written into the quarantined account's physical auth JSON once per quarantine; see the [write-safety tradeoff](troubleshooting.md#a-quarantined-auth-briefly-appears-enabled-after-the-sentinel-write).
 
 Then change only:
 

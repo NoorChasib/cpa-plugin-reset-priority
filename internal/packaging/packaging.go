@@ -186,8 +186,11 @@ func ValidateRegistry(raw []byte) (*Registry, error) {
 	if err := json.Unmarshal(raw, &reg); err != nil {
 		return nil, fmt.Errorf("registry.json is not valid JSON: %w", err)
 	}
-	if reg.SchemaVersion != 1 && reg.SchemaVersion != 2 {
-		return nil, fmt.Errorf("schema_version must be 1 or 2, got %d", reg.SchemaVersion)
+	// The audited store registry contract is schema_version 1 exactly. Any
+	// other version (including a future 2) has unaudited semantics and must be
+	// rejected rather than assumed compatible.
+	if reg.SchemaVersion != 1 {
+		return nil, fmt.Errorf("schema_version must be exactly 1, got %d", reg.SchemaVersion)
 	}
 	if len(reg.Plugins) == 0 {
 		return nil, fmt.Errorf("registry has no plugins")

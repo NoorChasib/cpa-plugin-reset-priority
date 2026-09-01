@@ -14,6 +14,40 @@ env:
   GOFLAGS: "-buildvcs=false -trimpath"
 
 jobs:
+  test:
+    name: Test tagged source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Validate the tagged tree before any release assets can publish;
+      # -trimpath is a packaging concern and is not needed here.
+      GOFLAGS: "-buildvcs=false"
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v5
+
+      - name: Set up Go 1.26.0
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Check formatting
+        run: make fmt-check
+
+      - name: Run go vet
+        run: make vet
+
+      - name: Run staticcheck
+        run: make lint
+
+      - name: Run tests
+        run: make test
+
+      - name: Run race tests
+        run: make race
+
   build-linux:
     name: Build linux/${{ matrix.goarch }} (manylinux2014)
     runs-on: ${{ matrix.runner }}
@@ -231,7 +265,10 @@ jobs:
 
   release:
     name: Publish GitHub release
+    # Publication is gated on the full test suite in addition to every build:
+    # if any needed job fails or is skipped, no release asset is published.
     needs:
+      - test
       - build-linux
       - build-darwin
       - build-windows

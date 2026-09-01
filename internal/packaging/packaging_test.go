@@ -116,6 +116,9 @@ func TestValidateRegistryShape(t *testing.T) {
 		"repo extra path": `{"schema_version":1,"plugins":[{"id":"x","name":"X","description":"d","author":"a","repository":"https://github.com/a/b/c"}]}`,
 		"leading v":       `{"schema_version":1,"plugins":[{"id":"x","name":"X","description":"d","author":"a","version":"v1.0.0","repository":"https://github.com/a/b"}]}`,
 		"bad schema":      `{"schema_version":7,"plugins":[]}`,
+		"schema 0":        `{"schema_version":0,"plugins":[{"id":"x","name":"X","description":"d","author":"a","repository":"https://github.com/a/b"}]}`,
+		"schema 2":        `{"schema_version":2,"plugins":[{"id":"x","name":"X","description":"d","author":"a","repository":"https://github.com/a/b"}]}`,
+		"missing schema":  `{"plugins":[{"id":"x","name":"X","description":"d","author":"a","repository":"https://github.com/a/b"}]}`,
 		"no plugins":      `{"schema_version":1,"plugins":[]}`,
 		"not json":        `nope`,
 	}
@@ -260,16 +263,14 @@ func TestValidateArchiveLayout(t *testing.T) {
 	}
 }
 
-// TestRepositoryRegistryJSONIfPresent validates the repo root registry.json
-// once it exists (release packaging is a later deliverable).
-func TestRepositoryRegistryJSONIfPresent(t *testing.T) {
+// TestRepositoryRegistryJSON validates the repo root registry.json. The file
+// is a shipped release deliverable, so its absence is a hard failure rather
+// than a skip.
+func TestRepositoryRegistryJSON(t *testing.T) {
 	path := filepath.Join("..", "..", "registry.json")
 	raw, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		t.Skip("registry.json not created yet (packaging deliverable)")
-	}
 	if err != nil {
-		t.Fatalf("read registry.json: %v", err)
+		t.Fatalf("registry.json must exist at the repository root: %v", err)
 	}
 	reg, err := ValidateRegistry(raw)
 	if err != nil {

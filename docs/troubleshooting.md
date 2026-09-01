@@ -58,6 +58,7 @@ Do not post complete debug logs without reviewing them for unrelated secrets.
 
   ```text
   GET  /v0/management/plugins/reset-priority/status
+  GET  /v0/management/plugins/reset-priority/status/html
   POST /v0/management/plugins/reset-priority/refresh
   GET  /v0/resource/plugins/reset-priority/status
   ```
@@ -114,13 +115,17 @@ Quarantine is limited to definitive credential-health conditions such as:
 - `invalid_grant`;
 - explicit reauthentication-required state.
 
-The desired priority is `0`, and the account is excluded from the healthy count.
+The desired priority is `0`, the account is excluded from the healthy count, and the sentinel `0` is written into the physical auth JSON once, at quarantine time.
 
-`Unavailable == true` alone is not enough. Quota exhaustion, HTTP 429, CPA cooldown/backoff, temporary model cooldown, overloaded errors, and generic network/5xx/timeouts must not cause quarantine.
+`Unavailable == true` alone is not enough. Quota exhaustion, HTTP 429, CPA cooldown/backoff, temporary model cooldown, overloaded errors, and generic network/5xx/timeouts must not cause quarantine. If one CPA error message combines explicit quota/rate-limit/429/cooldown wording with a generic marker such as `forbidden`, `403`, `revoked`, or `reauth`, the transient wording wins and the plugin does not quarantine. Disabled state, `unauthorized`, and `invalid_grant` remain authoritative even when transient wording also appears.
+
+While any account is quarantined or recovering, the plugin also runs a short local health probe roughly every minute using the `host.auth.get_runtime` callback. It reads runtime health fields only — never credential JSON, and never a provider quota request — so CPA self-recovery (a successful background token refresh, or an operator re-enabling/re-authenticating the credential) is noticed within about a minute instead of at the next hourly reconciliation. The probe never changes state on its own: a detected transition triggers the ordinary full reconciliation, which still owns health transitions, sentinel writes, and the sentinel-before-fetch recovery ordering. The probe stops as soon as every managed account is healthy. After this plugin itself wrote a sentinel, an `active` runtime record is not accepted as recovery until `last_refresh` or the physical file modification time is newer than that write; this prevents the audited save-side active rebuild from masquerading as self-recovery.
 
 ## An account is `recovering`
 
-CPA reports that a previously quarantined credential is healthy again, but the plugin has not confirmed a fresh future weekly reset observed after recovery. The account stays at `0` by design.
+CPA reports that a previously quarantined credential is healthy again, but the plugin has not confirmed a fresh future weekly reset observed after recovery. The account stays at `0` by design, and the physical sentinel `0` written at quarantine time stays in place until that fresh observation arrives.
+
+Faster detection does not mean faster promotion. The one-minute health probe only notices that CPA changed the credential's runtime health; promotion still requires a weekly-reset request that *began after* recovery and returned a reset timestamp in the future. An expired pre-failure window can never re-promote the account.
 
 Do not work around this by copying an old reset or manually forcing a normal priority. Trigger a refresh and allow the bounded recovery retries. Reauthenticate again if the provider quota endpoint remains unauthorized.
 
@@ -151,11 +156,21 @@ Actions:
 
 This limitation is why release/install acceptance includes a CPA restart and new-session routing validation. The plugin does not patch CPA's selector in v0.1.0.
 
-## A disabled auth appears enabled after another tool saved it
+## A quarantined auth briefly appears enabled after the sentinel write
 
-At the audited upstream revision, the immediate `host.auth.save` rebuild path constructs an active runtime record and does not preserve quarantine state reliably. `reset-priority` avoids this hazard by never saving a credential CPA definitively reports as disabled, unauthorized, revoked, or reauthentication-required; it reports desired sentinel `0` in authenticated status instead.
+This is a known, accepted tradeoff at the audited CPA revision.
 
-If another plugin or management operation saved a disabled auth, reapply the intended disabled state through CPA and restart/reload. Do not ask `reset-priority` to force-write `0` to a disabled file.
+`host.auth.save` rebuilds the runtime auth record from the supplied document. The audited rebuild sets `Status=active` and leaves `Disabled`/`Unavailable` at their zero values, and it carries over only `CreatedAt`, `LastRefreshedAt`, `NextRetryAfter`, and `Runtime` from the previous record. It does not read a `disabled` key out of the JSON. Any `host.auth.save` therefore transiently re-activates the credential's runtime record, whoever performs it.
+
+`reset-priority` writes the quarantine sentinel `0` into the physical auth JSON anyway, because a sentinel that exists only in plugin status does not demote anything: CPA's selector reads priority from the auth record, so an unwritten sentinel leaves a dead credential competing at its old rank until an operator intervenes. The residual exposure is bounded:
+
+- the write happens **once per quarantine**, not on every reconciliation — the read-latest/no-op-skip rule means a sentinel that is already physical is never re-saved;
+- the document's own fields are preserved byte-for-byte, so any `disabled` key in the file survives for CPA's auth-file watcher to re-establish;
+- the credential is at the sentinel priority, so it is last in selection order even while its runtime record reads active;
+- the plugin records the successful sentinel-write time and refuses to treat the resulting `active` runtime record as recovery unless a later token refresh or physical-file update provides post-write evidence;
+- a revoked or reauthentication-required credential simply fails again on next use, and CPA re-quarantines it, which the one-minute health probe now notices promptly.
+
+If an intentionally disabled auth stays enabled after CPA's watcher cycle, reapply the intended disabled state through CPA and restart/reload. The sentinel priority itself is correct and should be left at `0`.
 
 ## Existing sessions do not move to the new highest priority
 
@@ -184,18 +199,19 @@ Set `dry-run: false` only after the computed order is accepted, then restart/rec
 This separation is intentional:
 
 - `POST /v0/management/plugins/reset-priority/refresh` is authenticated and mutating.
+- `GET /v0/management/plugins/reset-priority/status/html` is the authenticated browser status view; its Refresh now button makes a same-origin call to the authenticated refresh route and preserves the query string.
 - `GET /v0/resource/plugins/reset-priority/status` is an unauthenticated, read-only, static readiness shell with no account-level details.
 
-Query parameters sent to the resource route are inert. Never expose mutation or operational account data through the resource route.
+Query parameters sent to either route are not management credentials; parameters on the resource route are inert. At the audited CPA revision, management authentication is accepted only through `Authorization: Bearer ...` or `X-Management-Key`, so ordinary address-bar navigation cannot authenticate the HTML route. Use a browser/profile or authenticated reverse proxy that supplies the header to both the page GET and same-origin refresh POST. If that is unavailable, use the authenticated JSON route and `curl`. Never expose mutation or operational account data through the resource route.
 
 ## Provider request failures
 
 The plugin uses CPA's proxy-aware `host.http.do` callback with a per-request timeout (default `10s`). It never logs provider bodies or authorization headers.
 
 - Claude uses `https://api.anthropic.com/api/oauth/usage` and reads only `seven_day.resets_at`.
-- Codex uses `https://chatgpt.com/backend-api/wham/usage` and reads only a window declared as exactly `604800` seconds/`10080` minutes.
+- Codex uses `https://chatgpt.com/backend-api/wham/usage` with a Codex-CLI-shaped `User-Agent`, requires a resolved ChatGPT account ID for `Chatgpt-Account-Id`, and reads only a window declared as exactly `604800` seconds/`10080` minutes. If the account ID is absent from credential metadata and cannot be recovered from the ID token, the probe fails before HTTP rather than making an unscoped usage request.
 
-Check outbound connectivity/proxy configuration and OAuth health in CPA. A single timeout, network failure, 5xx, or telemetry schema error does not quarantine the auth.
+Check outbound connectivity/proxy configuration and OAuth health in CPA. A single timeout, network failure, 5xx, account-ID resolution failure, or telemetry schema error does not quarantine the auth; it leaves the weekly reset unknown/stale and surfaces a sanitized provider warning.
 
 ## Release archive or checksum validation fails
 

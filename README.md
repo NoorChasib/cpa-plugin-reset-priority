@@ -9,7 +9,7 @@ The plugin is a priority manager, not a utilization-balancing scheduler. It does
 The exact deadline of the regular weekly quota is the only value allowed to determine ordering among healthy accounts:
 
 - Claude: `seven_day.resets_at`
-- Codex: the window whose declared duration is exactly `604800` seconds (`10080` minutes), using `reset_at`/`resetAt` or `reset_after_seconds`/`resetAfterSeconds`
+- Codex: the window whose declared duration is exactly `604800` seconds (`10080` minutes), using `reset_at`/`resetAt` or `reset_after_seconds`/`resetAfterSeconds`; usage probes require a resolved ChatGPT account ID and send a Codex-CLI-shaped `User-Agent`
 
 The plugin does not rank from utilization, percentage used or remaining, five-hour windows, model-scoped Claude windows, monthly Codex windows, additional/code-review limits, reset credits, plan type, burn rate, request success, cooldown state, or any other signal.
 
@@ -42,11 +42,13 @@ Only definitive credential-health failures leave the active ranking pool:
 - narrow CPA auth-error states indicating unauthorized, revoked, forbidden, `invalid_grant`, or reauthentication required;
 - recovered credentials that have not yet produced a fresh post-recovery future weekly reset.
 
-These accounts receive priority `0` and do not count in the healthy `N`.
+These accounts receive priority `0`, do not count in the healthy `N`, and have that sentinel written into their physical auth JSON so CPA's selector actually demotes them.
 
-Quota exhaustion, HTTP 429, CPA cooldown/backoff, temporary unavailability, five-hour exhaustion, model-specific exhaustion, and generic network/provider failures are not quarantine signals. CPA continues to own request-time availability and failover.
+Quota exhaustion, HTTP 429, CPA cooldown/backoff, temporary unavailability, five-hour exhaustion, model-specific exhaustion, and generic network/provider failures are not quarantine signals. If explicit transient wording appears alongside a generic auth marker such as `forbidden`, `403`, `revoked`, or `reauth`, the transient classification wins; disabled state, `unauthorized`, and `invalid_grant` remain authoritative. CPA continues to own request-time availability and failover.
 
-A reauthenticated account remains `recovering` at `0` until the plugin confirms a future regular weekly reset observed after recovery. Cached pre-failure data cannot re-promote it.
+While any account is quarantined or recovering, the plugin runs a short local health probe (about once a minute) over the `host.auth.get_runtime` callback. It reads runtime health fields only — no credential JSON and no provider quota request — so CPA self-recovery is detected in about a minute rather than at the next hourly reconciliation. The probe never mutates state; a detected change triggers the ordinary reconciliation. It is disarmed whenever every managed account is healthy. After the plugin itself saves a quarantine sentinel, it requires a later token-refresh or physical-file modification timestamp before accepting the host's `active` runtime state as recovery, preventing the audited save-side active rebuild from falsely re-enabling the account.
+
+A reauthenticated account remains `recovering` at `0` until the plugin confirms a future regular weekly reset observed after recovery. Faster detection does not shortcut this: cached pre-failure data cannot re-promote it.
 
 ## Exact reset rollover
 
@@ -67,7 +69,7 @@ Codex can lazily continue reporting an expired window. v0.1.0 keeps the account 
 
 - A current plugin-capable CLIProxyAPI build with native plugin ABI v1 support
 - Persistent access to CPA's plugin directory
-- Physical Claude and/or Codex OAuth auth files exposed by CPA host callbacks
+- Physical Claude and/or Codex OAuth auth files exposed by CPA host callbacks (`host.auth.list`, `host.auth.get`, `host.auth.get_runtime`, `host.auth.save`, `host.http.do`, `host.log`)
 - Go 1.26.0 and a native C toolchain only when building from source
 
 The v0.1.0 release workflow builds these five native targets:
@@ -135,6 +137,7 @@ The plugin exposes:
 | Route | Access | Behavior |
 | --- | --- | --- |
 | `GET /v0/management/plugins/reset-priority/status` | Authenticated CPA Management API | Sanitized JSON snapshot. |
+| `GET /v0/management/plugins/reset-priority/status/html` | Authenticated CPA Management API | Browser HTML status view rendered from the same sanitized snapshot, with a Refresh now action. |
 | `POST /v0/management/plugins/reset-priority/refresh` | Authenticated CPA Management API | Synchronous full reconciliation. |
 | `GET /v0/resource/plugins/reset-priority/status` | Unauthenticated resource route | Static readiness shell with no account-level data; never mutates state. |
 
@@ -152,6 +155,10 @@ curl --fail --silent --show-error -X POST \
   http://127.0.0.1:8317/v0/management/plugins/reset-priority/refresh
 ```
 
+The HTML status view at `GET /v0/management/plugins/reset-priority/status/html` is part of the authenticated Management API and requires the same management authentication as the JSON route. It shows per-account rows keyed by the physical auth file name (or a redacted stable auth-index when no file name exists) with provider, reset timestamp/state, current and desired priority, refresh health and sanitized errors, next deadline/reconcile timers, and the dry-run/stopped state. It deliberately omits the snapshot account label/email fields, tokens, and raw provider errors; physical filenames can still be identifying and should be redacted in screenshots. Its Refresh now button makes a same-origin `POST .../refresh` request and preserves the query string.
+
+At the audited CPA revision, Management API authentication is header-only (`Authorization: Bearer ...` or `X-Management-Key`); a query parameter is not a management credential, and ordinary address-bar navigation cannot add that header. Open the HTML route only through a browser/profile or authenticated reverse proxy that supplies the management header to both the page GET and its same-origin refresh POST. Otherwise use the authenticated JSON route and `curl` commands above.
+
 The browser resource is intentionally unauthenticated under CPA's resource-route model. It is a static readiness shell with no account labels, identifiers, timestamps, priorities, errors, configuration values, or actions:
 
 ```text
@@ -164,7 +171,9 @@ No route or log includes access tokens, refresh tokens, auth headers, raw auth J
 
 `host.auth.save` replaces a complete auth JSON document; it is not a field patch and has no compare-and-swap operation. Before every write, the plugin re-reads the latest physical document, changes only top-level `priority`, preserves unrelated JSON values, skips no-op writes, and continues after per-account failures.
 
-The plugin never calls `host.auth.save` in dry-run. It also refuses to save any credential CPA definitively reports as quarantined—disabled, unauthorized, revoked, or reauthentication-required—because the audited upstream save/upsert path can reconstruct such an auth as active and silently reactivate it.
+The plugin never calls `host.auth.save` in dry-run.
+
+Quarantined credentials **are** written, once, to persist the sentinel `0`. This is a deliberate tradeoff. At the audited revision the save/upsert path rebuilds the runtime record as `Status=active` with `Disabled` unset and does not read a `disabled` key from the document, so any save transiently reactivates the runtime record. A sentinel that lives only in plugin status demotes nothing, because CPA's selector reads priority from the auth record — so the write is what actually removes a dead credential from competition. The exposure is bounded by the no-op-skip rule (one write per quarantine, never per reconciliation), by verbatim preservation of every other field including any `disabled` key, by the sentinel priority itself putting the credential last in selection order, by requiring post-write refresh/file evidence before accepting recovery, and by CPA re-quarantining a genuinely broken credential on next use. See [troubleshooting](docs/troubleshooting.md).
 
 ## Current upstream compatibility caveats
 
@@ -175,6 +184,9 @@ The ABI and auth behavior were audited against CLIProxyAPI commit `81e1b5374f99c
 3. **The plugin does not implement request-level routing.** It writes credential priorities and relies on CPA for quota exhaustion, cooldowns, 429 handling, retries, and fallthrough.
 4. **A same-path native unload/reinstall requires a CPA restart.** Once a resident CPA process has run the plugin's terminal native shutdown, the library's Go runtime state in that process is permanently terminal. A later `cliproxy_plugin_init` for the same library path is refused (nonzero) instead of reinitializing terminal state. Restart CPA to load a reinstalled or updated library.
 5. **Terminal shutdown waits unboundedly for host callbacks already in flight.** ABI v1 host callbacks carry no cancellation, so shutdown must drain an entered callback before the host may release the host API table; abandoning it on a timer would risk use-after-free during unload. If a host callback (typically `host.http.do` without a host-side deadline) never returns, plugin unload blocks until CPA exits. There is no safe plugin-side bounded drain at this ABI; see [troubleshooting](docs/troubleshooting.md).
+6. **`host.auth.save` transiently reactivates the runtime auth record.** At the audited revision the save-side rebuild sets `Status=active`, leaves `Disabled`/`Unavailable` unset, and does not read a `disabled` key from the supplied document; it carries over only `CreatedAt`, `LastRefreshedAt`, `NextRetryAfter`, and `Runtime`. This affects any caller of the callback. The plugin accepts it in order to persist the quarantine sentinel, bounds it to one write per quarantine, and does not accept the resulting active record as recovery unless a later refresh/file timestamp proves a post-write change; see [Write safety](#write-safety).
+7. **`host.auth.get_runtime` returns an error rather than an entry for some healthy-looking cases.** At the audited revision it errors on an unknown auth index, on a runtime-only auth that is disabled, and on a disabled or management-removed file-backed auth whose file no longer exists. The health probe therefore treats every probe error as "no observation" and defers to roster reconciliation, never as a health transition.
+8. **Browser management authentication remains header-only.** CPA accepts `Authorization: Bearer ...` or `X-Management-Key`; it does not authenticate a management route from its query string. The HTML status route and Refresh action therefore require a browser/profile or authenticated reverse proxy that supplies the header to both requests.
 
 ## Build and validation
 
@@ -212,7 +224,9 @@ It performs no real OAuth calls and keeps evidence under `dist/smoke/<run-id>/`.
 - [ ] Adding a second healthy account automatically yields `200 / 100`.
 - [ ] The next exact reset deadline appears in status.
 - [ ] Quota/429/cooldown/unavailable states do not cause quarantine by themselves.
-- [ ] A disabled or definitive reauth-required auth is outside the healthy count at `0`.
+- [ ] A disabled or definitive reauth-required auth is outside the healthy count at `0`, and (outside dry-run) its physical auth JSON carries `"priority": 0`.
+- [ ] A steady quarantined account produces no repeated writes across several reconciliations.
+- [ ] CPA self-recovery of a quarantined credential is reflected in status within about a minute.
 - [ ] A recovered auth remains at `0` until a fresh post-recovery future weekly reset is confirmed.
 - [ ] A deadline event demotes locally before a provider network refresh succeeds.
 - [ ] `dry-run: false` is enabled only after all desired priorities are verified.

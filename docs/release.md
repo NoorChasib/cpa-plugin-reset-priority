@@ -143,12 +143,15 @@ Against the target CPA deployment:
 7. verify Claude uses only `seven_day.resets_at`;
 8. verify Codex uses only the exact `604800`-second weekly window;
 9. verify 429/quota/cooldown/unavailable do not quarantine;
-10. verify disabled/reauth-required accounts are at sentinel `0`;
-11. verify recovered accounts require a fresh post-recovery future reset;
-12. verify exact deadline demotion occurs before network recovery;
-13. test routing with new session IDs after any necessary CPA restart.
+10. verify disabled/reauth-required accounts are at sentinel `0`, and that (outside dry-run) the sentinel reached the physical auth JSON exactly once;
+11. verify repeated reconciliations and health polls on a steady quarantined account produce no further `host.auth.save` calls;
+12. verify recovered accounts require a fresh post-recovery future reset;
+13. verify CPA self-recovery of a quarantined credential is picked up within roughly a minute rather than at the next hourly reconciliation;
+14. verify the active runtime record created by the plugin's own sentinel save is not mistaken for recovery without a newer token-refresh or physical-file timestamp;
+15. verify exact deadline demotion occurs before network recovery;
+16. test routing with new session IDs after any necessary CPA restart.
 
-Keep all evidence sanitized. Status screenshots can contain account labels; redact them if they are private.
+Keep all evidence sanitized. The authenticated HTML view omits snapshot label/email fields, but physical auth filenames can still identify accounts; redact them in screenshots.
 
 ## 6. Review the release diff
 
@@ -273,7 +276,7 @@ Release notes must state:
 - smoke-test result or explicit unexecuted status;
 - real-account dry-run result or explicit unexecuted status;
 - supported five-platform matrix and unsupported gaps;
-- `host.auth.save` whole-document/quarantined-auth safety caveat;
+- `host.auth.save` whole-document caveat and the accepted transient runtime reactivation from persisting the quarantine sentinel;
 - runtime selector propagation caveat and whether restart was needed;
 - session-affinity behavior observed;
 - Codex lazy-reset passive-only limitation;
