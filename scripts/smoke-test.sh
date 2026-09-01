@@ -7,7 +7,7 @@ PLUGIN_INPUT="${1:-${ROOT_DIR}/reset-priority.so}"
 TIMEOUT_SECONDS="${CPA_SMOKE_TIMEOUT_SECONDS:-90}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
 CONTAINER_NAME="cpa-reset-priority-smoke-${RUN_ID}"
-PLUGIN_VOLUME="cpa-reset-priority-smoke-plugins-${RUN_ID}"
+PLUGIN_VOLUME=""
 ARTIFACT_DIR="${CPA_SMOKE_ARTIFACT_DIR:-${ROOT_DIR}/dist/smoke/${RUN_ID}}"
 
 for command_name in docker curl install realpath; do
@@ -28,35 +28,41 @@ if [[ ! -f "${PLUGIN_INPUT}" ]]; then
 fi
 
 PLUGIN_INPUT="$(realpath "${PLUGIN_INPUT}")"
-TMP_DIR="$(mktemp -d)"
-STAGED_PLUGIN="${TMP_DIR}/reset-priority.so"
+TMP_DIR=""
+STAGED_PLUGIN=""
 LOG_FILE="${ARTIFACT_DIR}/container.log"
 RESPONSE_FILE="${ARTIFACT_DIR}/status.html"
+CONTAINER_ID=""
 CONTAINER_CREATED=false
 VOLUME_CREATED=false
 
-mkdir -p "${ARTIFACT_DIR}"
-install -m 0755 -- "${PLUGIN_INPUT}" "${STAGED_PLUGIN}"
-
-# Invoked indirectly by the EXIT trap below.
+# Invoked indirectly by the EXIT trap below. It is installed before mktemp so
+# every temporary-directory and staging failure path is covered.
 # shellcheck disable=SC2329
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
   set +e
 
-  if [[ "${CONTAINER_CREATED}" == true ]] && docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
-    docker logs "${CONTAINER_NAME}" >"${LOG_FILE}" 2>&1 || true
-    docker container inspect "${CONTAINER_NAME}" >"${ARTIFACT_DIR}/container-inspect.json" 2>/dev/null || true
-    local runtime_version
-    runtime_version="$(grep -m1 '^CLIProxyAPI Version:' "${LOG_FILE}" 2>/dev/null || true)"
-    printf 'runtime_version=%s\n' "${runtime_version:-unavailable in captured logs}" >>"${ARTIFACT_DIR}/image.txt"
-    docker rm --force "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  if [[ "${CONTAINER_CREATED}" == true ]]; then
+    if docker container inspect "${CONTAINER_ID}" >/dev/null 2>&1; then
+      docker logs "${CONTAINER_ID}" >"${LOG_FILE}" 2>&1 || true
+      docker container inspect "${CONTAINER_ID}" >"${ARTIFACT_DIR}/container-inspect.json" 2>/dev/null || true
+      local runtime_version
+      runtime_version="$(grep -m1 '^CLIProxyAPI Version:' "${LOG_FILE}" 2>/dev/null || true)"
+      printf 'runtime_version=%s\n' "${runtime_version:-unavailable in captured logs}" >>"${ARTIFACT_DIR}/image.txt"
+    fi
+    # Once create succeeded, removal is unconditional: a transient inspect
+    # failure must not leak the container. The returned ID avoids touching an
+    # unrelated container if a name collision occurs in another run.
+    docker rm --force "${CONTAINER_ID}" >/dev/null 2>&1 || true
   fi
   if [[ "${VOLUME_CREATED}" == true ]]; then
     docker volume rm --force "${PLUGIN_VOLUME}" >/dev/null 2>&1 || true
   fi
-  rm -rf -- "${TMP_DIR}"
+  if [[ -n "${TMP_DIR}" ]]; then
+    rm -rf -- "${TMP_DIR}"
+  fi
 
   if (( status != 0 )); then
     printf 'smoke test failed; captured evidence: %s\n' "${ARTIFACT_DIR}" >&2
@@ -72,6 +78,11 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+TMP_DIR="$(mktemp -d)"
+STAGED_PLUGIN="${TMP_DIR}/reset-priority.so"
+mkdir -p "${ARTIFACT_DIR}"
+install -m 0755 -- "${PLUGIN_INPUT}" "${STAGED_PLUGIN}"
 
 printf 'pulling CPA image %s\n' "${IMAGE}"
 docker pull "${IMAGE}" | tee "${ARTIFACT_DIR}/pull.txt"
@@ -139,15 +150,19 @@ plugins:
 YAML
 chmod 0600 "${TMP_DIR}/config.yaml"
 
-docker volume create "${PLUGIN_VOLUME}" >/dev/null
+# Let Docker allocate the name atomically. Supplying our own name would make
+# `volume create` idempotently adopt a pre-existing volume and cleanup could
+# then remove storage owned by another concurrent invocation.
+PLUGIN_VOLUME="$(docker volume create \
+  --label "reset-priority.smoke-run=${RUN_ID}")"
 VOLUME_CREATED=true
 
-docker create \
+CONTAINER_ID="$(docker create \
   --name "${CONTAINER_NAME}" \
   --publish "127.0.0.1::8317" \
   --mount "type=volume,src=${PLUGIN_VOLUME},dst=/CLIProxyAPI/plugins" \
   --mount "type=bind,src=${TMP_DIR}/config.yaml,dst=/CLIProxyAPI/config.yaml,readonly" \
-  "${IMAGE}" >/dev/null
+  "${IMAGE}")"
 CONTAINER_CREATED=true
 
 # Copy a staged, fixed-name, executable library into the stopped container. The
