@@ -336,20 +336,48 @@ func TestCodexRequestShape(t *testing.T) {
 	if got := req.Headers["Chatgpt-Account-Id"]; len(got) != 1 || got[0] != "acct-1" {
 		t.Errorf("Chatgpt-Account-Id = %v", got)
 	}
+}
 
-	// Without an account ID, the header is omitted entirely.
-	doer2 := &captureDoer{body: `{}`}
-	if _, err := NewCodex(doer2, nowFn).FetchWeeklyReset(context.Background(), Credentials{AccessToken: "secret"}); err != nil {
+func TestCodexSendsCLIShapedUserAgent(t *testing.T) {
+	doer := &captureDoer{body: `{}`}
+	_, err := NewCodex(doer, nowFn).FetchWeeklyReset(context.Background(), Credentials{AccessToken: "tok", AccountID: "acct-1"})
+	if err != nil {
 		t.Fatalf("FetchWeeklyReset: %v", err)
 	}
-	if _, ok := doer2.lastReq.Headers["Chatgpt-Account-Id"]; ok {
-		t.Errorf("Chatgpt-Account-Id sent without an account id")
+	got := doer.lastReq.Headers["User-Agent"]
+	if len(got) != 1 {
+		t.Fatalf("User-Agent = %v, want exactly one value", got)
+	}
+	if got[0] != codexUserAgent {
+		t.Errorf("User-Agent = %q, want %q", got[0], codexUserAgent)
+	}
+	if !strings.HasPrefix(got[0], "codex_cli_rs/") {
+		t.Errorf("User-Agent %q is not CLI-shaped (want codex_cli_rs/ prefix)", got[0])
+	}
+}
+
+func TestCodexEmptyAccountIDFailsClosedBeforeHTTP(t *testing.T) {
+	doer := &captureDoer{body: `{}`}
+	_, err := NewCodex(doer, nowFn).FetchWeeklyReset(context.Background(), Credentials{AccessToken: "super-secret-token"})
+	if err == nil {
+		t.Fatalf("want error when the account id cannot be resolved")
+	}
+	if doer.calls != 0 {
+		t.Errorf("HTTPDo called %d times, want 0 (must fail closed before HTTP)", doer.calls)
+	}
+	// The error must be static and non-secret: no token material, no
+	// account data, only a description of the missing account id.
+	if strings.Contains(err.Error(), "super-secret-token") {
+		t.Errorf("error leaks the access token: %v", err)
+	}
+	if want := "codex account id could not be resolved from credentials"; err.Error() != want {
+		t.Errorf("err = %q, want static message %q", err.Error(), want)
 	}
 }
 
 func TestCodexHTTPErrorIsSanitized(t *testing.T) {
 	doer := &captureDoer{status: 500, body: `{"detail":"internal, includes account data"}`}
-	_, err := NewCodex(doer, nowFn).FetchWeeklyReset(context.Background(), Credentials{AccessToken: "tok"})
+	_, err := NewCodex(doer, nowFn).FetchWeeklyReset(context.Background(), Credentials{AccessToken: "tok", AccountID: "acct"})
 	if err == nil {
 		t.Fatalf("want error on HTTP 500")
 	}

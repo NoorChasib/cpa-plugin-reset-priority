@@ -68,6 +68,17 @@ func (c *fakeHostCaller) Call(method string, request []byte) ([]byte, error) {
 			}
 		}
 		return ok(hostapi.AuthGetResponse{AuthIndex: req.AuthIndex, Name: name, JSON: doc})
+	case hostapi.MethodHostAuthGetRuntime:
+		var req hostapi.AuthGetRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, err
+		}
+		for _, e := range c.entries {
+			if e.AuthIndex == req.AuthIndex {
+				return ok(hostapi.AuthGetRuntimeResponse{Auth: e})
+			}
+		}
+		return json.Marshal(hostapi.Envelope{OK: false, Error: &hostapi.EnvelopeError{Code: "not_found", Message: "auth not found"}})
 	case hostapi.MethodHostAuthSave:
 		var req hostapi.AuthSaveRequest
 		if err := json.Unmarshal(request, &req); err != nil {

@@ -1,6 +1,8 @@
 // Package engine implements discovery, weekly-reset observation, quarantine
-// and recovery, deterministic ranking, exact deadline timers, bounded
-// retries, and priority writeback for the reset-priority plugin.
+// and recovery (including a short-cadence local health probe over
+// host.auth.get_runtime while any account is quarantined or recovering),
+// deterministic ranking, exact deadline timers, bounded retries, and
+// priority writeback for the reset-priority plugin.
 package engine
 
 import (
@@ -32,10 +34,27 @@ var resetRetryDelays = []time.Duration{
 	15 * time.Minute,
 }
 
+// healthPollInterval is the short cadence of the local credential-health
+// probe that runs only while at least one account is quarantined or
+// recovering. Each tick reads runtime health via host.auth.get_runtime (a
+// cheap local manager lookup, never a provider request and never credential
+// JSON) so CPA self-recovery — a successful token refresh or an operator
+// re-enabling/re-authenticating an auth — is detected within about a minute
+// instead of waiting for the next hourly reconciliation. The bounded
+// resetRetryDelays ladder is deliberately NOT reused here: it ends ~22
+// minutes after the triggering event, while self-recovery can happen hours
+// later, which would reintroduce the reconcile-interval detection latency.
+const healthPollInterval = time.Minute
+
 // HostAuth is the subset of host callbacks the engine needs.
 type HostAuth interface {
 	AuthList(ctx context.Context) ([]hostapi.AuthEntry, error)
 	AuthGet(ctx context.Context, authIndex string) (hostapi.AuthGetResponse, error)
+	// AuthGetRuntime returns the runtime health entry for one auth index
+	// without exposing credential JSON. Errors mean "no usable observation"
+	// (unknown index, disabled auth whose file disappeared, transient host
+	// failure) and must never be interpreted as a health transition.
+	AuthGetRuntime(ctx context.Context, authIndex string) (hostapi.AuthEntry, error)
 	AuthSave(ctx context.Context, name string, doc json.RawMessage) error
 }
 
@@ -91,6 +110,8 @@ type Engine struct {
 	deadlineTimer   clock.Timer
 	nextDeadlineAt  time.Time
 	deadlineSeq     uint64
+	healthPollTimer clock.Timer
+	healthPollSeq   uint64
 
 	lastRosterError string
 	status          Snapshot
@@ -162,6 +183,11 @@ func (e *Engine) Stop() {
 		e.deadlineTimer = nil
 	}
 	e.nextDeadlineAt = time.Time{}
+	e.healthPollSeq++
+	if e.healthPollTimer != nil {
+		e.healthPollTimer.Stop()
+		e.healthPollTimer = nil
+	}
 	for _, acct := range e.accounts {
 		acct.cancelRetriesLocked()
 	}
@@ -257,8 +283,9 @@ func (e *Engine) Reconcile(ctx context.Context, trigger string) {
 		// Cross-ABI host logging must never run under Engine.mu (see Logger).
 		e.logf("warn", "reset-priority: auth roster reconciliation deferred: "+rosterError)
 	} else {
-		// Roster health transitions are serialized with writeback. Once CPA has
-		// definitively quarantined an auth, no later host.auth.save may begin.
+		// Serialize roster health transitions with writeback so quarantine and
+		// recovery cannot race a stale rank write. A newly quarantined auth may
+		// then deliberately persist the sentinel through the next flush.
 		e.writeMu.Lock()
 		e.mu.Lock()
 		if e.stopped {
@@ -288,6 +315,7 @@ func (e *Engine) Reconcile(ctx context.Context, trigger string) {
 	}
 	e.scheduleRecoveryRetriesLocked()
 	e.scheduleNextReconcileLocked()
+	e.scheduleHealthPollLocked()
 	e.publishStatusLocked(e.clk.Now())
 	e.mu.Unlock()
 	_ = trigger
@@ -445,19 +473,22 @@ func (e *Engine) applyRosterLocked(entries []hostapi.AuthEntry, now time.Time) (
 			if acct.health != HealthQuarantined {
 				acct.cancelRetriesLocked()
 				acct.fetchEpoch++
+				acct.quarantineSentinelWrittenAt = time.Time{}
 			}
 			acct.health = HealthQuarantined
 			acct.quarantineReason = reason
 			acct.recoverySentinelReady = false
 			acct.wantRetrySchedule = false
 			acct.wantAwaitingRetry = false
-		case acct.health == HealthQuarantined:
-			// CPA reports the credential healthy again. Discard all pre-failure
-			// reset/fetch state and force a physical sentinel verification before
-			// a recovery request may promote the account.
+		case acct.health == HealthQuarantined && acct.hasPostSentinelRecoveryEvidence(entry):
+			// CPA reports the credential healthy again with evidence newer than any
+			// plugin-written sentinel. Discard all pre-failure reset/fetch state and
+			// force a physical sentinel verification before a recovery request may
+			// promote the account.
 			acct.health = HealthRecovering
 			acct.recoveredAt = now
 			acct.recoverySentinelReady = false
+			acct.quarantineSentinelWrittenAt = time.Time{}
 			acct.fetchEpoch++
 			acct.resetAt = time.Time{}
 			acct.resetState = ResetUnknown
@@ -967,6 +998,108 @@ func (e *Engine) rescheduleDeadlineLocked(now time.Time) {
 	seq := e.deadlineSeq
 	e.nextDeadlineAt = earliest
 	e.deadlineTimer = e.afterFunc(earliest.Sub(now), func() { e.onDeadline(seq) })
+}
+
+// scheduleHealthPollLocked arms (or disarms) the short-cadence local health
+// probe. It runs only while at least one account is quarantined or
+// recovering, keeps a single timer regardless of how many accounts are
+// unhealthy, and never resets a countdown that is already armed, so repeated
+// reconciles cannot stretch the detection latency.
+func (e *Engine) scheduleHealthPollLocked() {
+	needed := false
+	if !e.stopped {
+		for _, acct := range e.accounts {
+			if acct.health == HealthQuarantined || acct.health == HealthRecovering {
+				needed = true
+				break
+			}
+		}
+	}
+	if !needed {
+		e.healthPollSeq++
+		if e.healthPollTimer != nil {
+			e.healthPollTimer.Stop()
+			e.healthPollTimer = nil
+		}
+		return
+	}
+	if e.healthPollTimer != nil {
+		return
+	}
+	e.healthPollSeq++
+	seq := e.healthPollSeq
+	e.healthPollTimer = e.afterFunc(healthPollInterval, func() { e.onHealthPoll(seq) })
+}
+
+// onHealthPoll performs one health-probe generation. It reads runtime health
+// through host.auth.get_runtime — never credential JSON, never a provider
+// request, and never while holding Engine.mu (host callbacks may block or
+// re-enter, see Logger) — and compares it against the engine's last-known
+// health classification. Any transition-worthy difference (a quarantined
+// account no longer reporting a definitive credential-health failure, or a
+// recovering account regressing to one) triggers a full serialized
+// reconciliation: the probe itself never mutates account state, because only
+// the roster transaction owns health transitions, sentinel writes, and the
+// sentinel-before-fetch recovery ordering. Probe errors are skipped; the
+// reconcile interval remains the safety net.
+func (e *Engine) onHealthPoll(seq uint64) {
+	e.mu.Lock()
+	if e.stopped || seq != e.healthPollSeq {
+		e.mu.Unlock()
+		return
+	}
+	e.healthPollTimer = nil
+	type probe struct {
+		authIndex                   string
+		health                      Health
+		quarantineSentinelWrittenAt time.Time
+	}
+	var probes []probe
+	for _, acct := range e.accounts {
+		if acct.health == HealthQuarantined || acct.health == HealthRecovering {
+			probes = append(probes, probe{
+				authIndex:                   acct.authIndex,
+				health:                      acct.health,
+				quarantineSentinelWrittenAt: acct.quarantineSentinelWrittenAt,
+			})
+		}
+	}
+	e.mu.Unlock()
+
+	changed := false
+	for _, p := range probes {
+		entry, err := e.host.AuthGetRuntime(context.Background(), p.authIndex)
+		if err != nil {
+			// Unknown/removed auths and transient host failures carry no health
+			// information. Roster reconciliation owns removal and error surfacing.
+			continue
+		}
+		if entry.AuthIndex != "" && entry.AuthIndex != p.authIndex {
+			continue
+		}
+		quarantined, _ := quarantineReasonFor(entry)
+		if p.health == HealthQuarantined && !quarantined && !p.quarantineSentinelWrittenAt.IsZero() {
+			if !entry.LastRefresh.After(p.quarantineSentinelWrittenAt) && !entry.ModTime.After(p.quarantineSentinelWrittenAt) {
+				// host.auth.save itself rebuilds the runtime record as active. Do not
+				// mistake that plugin-created state for external recovery.
+				continue
+			}
+		}
+		if (p.health == HealthQuarantined) != quarantined {
+			changed = true
+			break
+		}
+	}
+	if changed {
+		// The reconcile tail re-arms or disarms the poll under its own seq.
+		e.Reconcile(context.Background(), "health-poll")
+		return
+	}
+	e.mu.Lock()
+	if !e.stopped && seq == e.healthPollSeq {
+		e.scheduleHealthPollLocked()
+	}
+	e.mu.Unlock()
 }
 
 // scheduleNextReconcileLocked arms the background reconciliation interval.

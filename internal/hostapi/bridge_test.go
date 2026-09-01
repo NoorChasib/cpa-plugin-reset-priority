@@ -71,6 +71,38 @@ func TestBridgeAuthGetRequestShape(t *testing.T) {
 	}
 }
 
+func TestBridgeAuthGetRuntimeWireShapes(t *testing.T) {
+	// The audited host wraps the list-shaped runtime entry in an "auth" key.
+	caller := &scriptedCaller{response: envelopeWith(t, AuthGetRuntimeResponse{Auth: AuthEntry{
+		AuthIndex: "i1", Name: "a.json", Provider: "claude",
+		Status: "error", StatusMessage: "unauthorized", Disabled: false,
+	}})}
+	entry, err := NewBridge(caller).AuthGetRuntime(context.Background(), "i1")
+	if err != nil {
+		t.Fatalf("AuthGetRuntime: %v", err)
+	}
+	if entry.Name != "a.json" || entry.Status != "error" || entry.StatusMessage != "unauthorized" {
+		t.Errorf("entry = %+v", entry)
+	}
+	if caller.calls[0].Method != MethodHostAuthGetRuntime {
+		t.Errorf("method = %s, want %s", caller.calls[0].Method, MethodHostAuthGetRuntime)
+	}
+	if got := caller.calls[0].Request; got != `{"auth_index":"i1"}` {
+		t.Errorf("request = %s", got)
+	}
+}
+
+func TestBridgeAuthGetRuntimeErrorEnvelope(t *testing.T) {
+	// Unknown indexes and disabled-with-missing-file auths come back as RPC
+	// errors at the audited host; the bridge must surface them as errors, not
+	// as empty entries a caller could misread as healthy.
+	raw, _ := json.Marshal(Envelope{OK: false, Error: &EnvelopeError{Code: "not_found", Message: "auth not found"}})
+	caller := &scriptedCaller{response: raw}
+	if _, err := NewBridge(caller).AuthGetRuntime(context.Background(), "gone"); err == nil || !strings.Contains(err.Error(), "not_found") {
+		t.Errorf("err = %v, want not_found", err)
+	}
+}
+
 func TestBridgeAuthSaveRequestShape(t *testing.T) {
 	caller := &scriptedCaller{response: envelopeWith(t, AuthSaveResponse{Name: "a.json", Path: "/x/a.json"})}
 	err := NewBridge(caller).AuthSave(context.Background(), "a.json", json.RawMessage(`{"priority":100}`))

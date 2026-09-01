@@ -24,16 +24,19 @@ type saveRecord struct {
 
 // fakeHost is an in-memory HostAuth double backed by physical-JSON docs.
 type fakeHost struct {
-	mu      sync.Mutex
-	entries []hostapi.AuthEntry
-	docs    map[string]json.RawMessage // by authIndex
-	listErr error
-	getErr  map[string]error // by authIndex
-	saveErr map[string]error // by name
+	mu         sync.Mutex
+	now        func() time.Time
+	entries    []hostapi.AuthEntry
+	docs       map[string]json.RawMessage // by authIndex
+	listErr    error
+	getErr     map[string]error // by authIndex
+	saveErr    map[string]error // by name
+	runtimeErr map[string]error // by authIndex
 
-	saves     []saveRecord
-	getCalls  []string
-	listCalls int
+	saves        []saveRecord
+	getCalls     []string
+	runtimeCalls []string
+	listCalls    int
 	// beforeGet mutates state just before AuthGet returns, simulating
 	// concurrent credential refreshes.
 	beforeGet func(authIndex string)
@@ -41,9 +44,11 @@ type fakeHost struct {
 
 func newFakeHost() *fakeHost {
 	return &fakeHost{
-		docs:    make(map[string]json.RawMessage),
-		getErr:  make(map[string]error),
-		saveErr: make(map[string]error),
+		now:        time.Now,
+		docs:       make(map[string]json.RawMessage),
+		getErr:     make(map[string]error),
+		saveErr:    make(map[string]error),
+		runtimeErr: make(map[string]error),
 	}
 }
 
@@ -92,6 +97,30 @@ func (h *fakeHost) AuthGet(ctx context.Context, authIndex string) (hostapi.AuthG
 	}, nil
 }
 
+// AuthGetRuntime mirrors the audited host callback: it answers from the
+// runtime roster entry only (health fields, no credential JSON) and returns
+// an error for unknown indexes.
+func (h *fakeHost) AuthGetRuntime(ctx context.Context, authIndex string) (hostapi.AuthEntry, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.runtimeCalls = append(h.runtimeCalls, authIndex)
+	if err := h.runtimeErr[authIndex]; err != nil {
+		return hostapi.AuthEntry{}, err
+	}
+	for _, e := range h.entries {
+		if e.AuthIndex == authIndex {
+			return e, nil
+		}
+	}
+	return hostapi.AuthEntry{}, fmt.Errorf("auth not found for auth_index %s", authIndex)
+}
+
+func (h *fakeHost) runtimeCallCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.runtimeCalls)
+}
+
 func (h *fakeHost) AuthSave(ctx context.Context, name string, doc json.RawMessage) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -106,11 +135,18 @@ func (h *fakeHost) AuthSave(ctx context.Context, name string, doc json.RawMessag
 	for i := range h.entries {
 		if h.entries[i].Name == name {
 			h.docs[h.entries[i].AuthIndex] = append(json.RawMessage(nil), doc...)
-			// Mirror the eventual watcher re-synthesis of priority into the
-			// runtime attribute.
+			// Mirror the audited host.auth.save upsert: it re-synthesizes priority
+			// but also rebuilds the runtime record as active/enabled. ModTime marks
+			// the physical write so the engine can distinguish this side effect
+			// from a later external refresh or operator reauthentication.
 			if p, ok := parsePriorityRaw(decoded["priority"]); ok {
 				h.entries[i].Priority = p
 			}
+			h.entries[i].Status = "active"
+			h.entries[i].StatusMessage = ""
+			h.entries[i].Disabled = false
+			h.entries[i].Unavailable = false
+			h.entries[i].ModTime = h.now()
 			return nil
 		}
 	}
@@ -325,6 +361,7 @@ func newTestEnv(t *testing.T, cfg config.Config) *testEnv {
 	t.Helper()
 	clk := clock.NewFake(baseTime)
 	host := newFakeHost()
+	host.now = clk.Now
 	claude := newFakeProvider("claude", clk.Now)
 	codex := newFakeProvider("codex", clk.Now)
 	async := &asyncQueue{}
@@ -345,6 +382,15 @@ func token(name string) string { return "tok-" + name }
 // addAccount registers a healthy account with entry, doc, and provider reset.
 func (env *testEnv) addAccount(provider, name string, resetAt time.Time) {
 	env.t.Helper()
+	doc := map[string]any{
+		"type":          provider,
+		"access_token":  token(name),
+		"refresh_token": "refresh-" + token(name),
+		"email":         name + "@example.com",
+	}
+	if provider == "codex" {
+		doc["account_id"] = "account-" + name
+	}
 	env.host.setEntry(hostapi.AuthEntry{
 		AuthIndex: "idx-" + name,
 		ID:        "id-" + name,
@@ -355,12 +401,7 @@ func (env *testEnv) addAccount(provider, name string, resetAt time.Time) {
 		Source:    "file",
 		Path:      "/auth/" + name + ".json",
 		Email:     name + "@example.com",
-	}, map[string]any{
-		"type":          provider,
-		"access_token":  token(name),
-		"refresh_token": "refresh-" + token(name),
-		"email":         name + "@example.com",
-	})
+	}, doc)
 	p := env.provider(provider)
 	if !resetAt.IsZero() {
 		p.setReset(token(name), resetAt)

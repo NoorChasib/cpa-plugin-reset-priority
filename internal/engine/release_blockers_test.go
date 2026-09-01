@@ -80,7 +80,7 @@ func newControlledFetch(obs providers.Observation) *controlledFetch {
 	return &controlledFetch{started: make(chan struct{}), release: make(chan struct{}), obs: obs}
 }
 
-func TestDefinitiveQuarantineNeverSavesAndRecoverySentinelPrecedesFetch(t *testing.T) {
+func TestDefinitiveQuarantinePersistsSentinelAndRecoverySentinelPrecedesFetch(t *testing.T) {
 	env := newTestEnv(t, defaultConfig())
 	env.addAccount("claude", "a", day(1))
 	env.reconcile()
@@ -92,22 +92,24 @@ func TestDefinitiveQuarantineNeverSavesAndRecoverySentinelPrecedesFetch(t *testi
 		entry.Unavailable = true
 	})
 	env.reconcile()
-	if got := len(env.host.savesFor("a.json")); got != initialSaves {
-		t.Fatalf("definitively quarantined auth was saved: %d saves, want %d", got, initialSaves)
+	// Quarantine persists the sentinel to the physical document rather than
+	// reporting it in status only.
+	if got := len(env.host.savesFor("a.json")); got != initialSaves+1 {
+		t.Fatalf("quarantine sentinel writes = %d, want %d", got, initialSaves+1)
+	}
+	if got, _ := env.host.docPriority(t, "idx-a"); got != 0 {
+		t.Fatalf("physical priority after quarantine = %d, want sentinel 0", got)
 	}
 	if row, _ := env.statusRow("a"); row.Health != string(HealthQuarantined) {
 		t.Fatalf("health = %s, want quarantined", row.Health)
 	}
+	initialSaves = len(env.host.savesFor("a.json"))
 
 	checker := &sentinelCheckingProvider{
 		host: env.host, authIndex: "idx-a", resetAt: day(3), now: env.clk.Now,
 	}
 	env.eng.providers = map[string]providers.Provider{"claude": checker}
-	env.host.updateEntry("idx-a", func(entry *hostapi.AuthEntry) {
-		entry.Status = "active"
-		entry.StatusMessage = ""
-		entry.Unavailable = false
-	})
+	recoverAccount(env, "idx-a")
 	env.reconcile()
 
 	checker.mu.Lock()
@@ -117,15 +119,15 @@ func TestDefinitiveQuarantineNeverSavesAndRecoverySentinelPrecedesFetch(t *testi
 	if calls != 1 || len(observed) != 1 || observed[0] != 0 {
 		t.Fatalf("recovery fetch saw priorities %v across %d calls, want one call after physical sentinel 0", observed, calls)
 	}
+	// The sentinel was already persisted at quarantine time, so the recovery
+	// pre-fetch sentinel verification re-reads the physical document, confirms
+	// the sentinel, and performs NO redundant save. Only the promotion writes.
 	saves := env.host.savesFor("a.json")
-	if len(saves) != initialSaves+2 {
-		t.Fatalf("recovery saves = %d total, want initial + sentinel + promoted", len(saves))
+	if len(saves) != initialSaves+1 {
+		t.Fatalf("recovery saves = %d total, want initial + promoted only (sentinel already physical)", len(saves))
 	}
-	if got, _ := parsePriorityRaw(saves[initialSaves].Doc["priority"]); got != 0 {
-		t.Fatalf("first post-health save priority = %d, want sentinel 0", got)
-	}
-	if got, _ := parsePriorityRaw(saves[initialSaves+1].Doc["priority"]); got != 100 {
-		t.Fatalf("second post-health save priority = %d, want promoted 100", got)
+	if got, _ := parsePriorityRaw(saves[initialSaves].Doc["priority"]); got != 100 {
+		t.Fatalf("post-recovery save priority = %d, want promoted 100", got)
 	}
 	if row, _ := env.statusRow("a"); row.Health != string(HealthHealthy) {
 		t.Fatalf("health after confirmed recovery = %s, want healthy", row.Health)
@@ -136,18 +138,22 @@ func TestRecoveryFailsClosedUntilSentinelWriteConfirmed(t *testing.T) {
 	env := newTestEnv(t, defaultConfig())
 	env.addAccount("claude", "a", day(1))
 	env.reconcile()
+	// The quarantine-time sentinel write fails too, so the physical document
+	// keeps its pre-failure rank and recovery genuinely has a sentinel to
+	// establish. (When the quarantine write succeeded, the recovery
+	// verification is a read-only no-op; that path is covered separately.)
+	env.host.saveErr["a.json"] = errFake("sentinel save failed")
 	env.host.updateEntry("idx-a", func(entry *hostapi.AuthEntry) {
 		entry.Status = "error"
 		entry.StatusMessage = "revoked credential"
 	})
 	env.reconcile()
+	if got, _ := env.host.docPriority(t, "idx-a"); got != 100 {
+		t.Fatalf("physical priority after failed quarantine sentinel write = %d, want the unchanged 100", got)
+	}
 
 	callsBefore := env.claude.callCount(token("a"))
-	env.host.updateEntry("idx-a", func(entry *hostapi.AuthEntry) {
-		entry.Status = "active"
-		entry.StatusMessage = ""
-	})
-	env.host.saveErr["a.json"] = errFake("sentinel save failed")
+	recoverAccount(env, "idx-a")
 	env.reconcile()
 	if got := env.claude.callCount(token("a")); got != callsBefore {
 		t.Fatalf("provider fetched before sentinel confirmation: %d calls, want %d", got, callsBefore)
@@ -176,10 +182,7 @@ func TestDryRunMaySimulateRecoveryWithZeroSaves(t *testing.T) {
 		entry.StatusMessage = "unauthorized"
 	})
 	env.reconcile()
-	env.host.updateEntry("idx-a", func(entry *hostapi.AuthEntry) {
-		entry.Status = "active"
-		entry.StatusMessage = ""
-	})
+	recoverAccount(env, "idx-a")
 	env.reconcile()
 
 	if got := env.host.saveCount(); got != 0 {
@@ -289,10 +292,7 @@ func TestPreQuarantineFetchCannotOverwriteRecoveredState(t *testing.T) {
 	env.reconcile()
 	env.eng.providers = map[string]providers.Provider{"claude": env.claude}
 	env.claude.setReset(token("a"), day(6))
-	env.host.updateEntry("idx-a", func(entry *hostapi.AuthEntry) {
-		entry.Status = "active"
-		entry.StatusMessage = ""
-	})
+	recoverAccount(env, "idx-a")
 	env.reconcile()
 
 	close(old.release)
@@ -521,16 +521,23 @@ func TestListPriorityZeroInvalidatesCachedNonzeroAndRepairsDrift(t *testing.T) {
 	}
 }
 
-func TestAuthMarkersOverrideQuotaWordingButQuotaAloneNeverQuarantines(t *testing.T) {
+func TestDefinitiveAuthMarkersOverrideQuotaWordingButGenericMarkersYield(t *testing.T) {
 	tests := []struct {
 		name    string
 		message string
 		want    bool
 	}{
+		// Narrow definitive credential failures stay authoritative even
+		// alongside quota/rate-limit wording.
 		{name: "unauthorized wins", message: "quota exhausted; unauthorized credential", want: true},
 		{name: "invalid grant wins", message: "429 cooldown after invalid_grant", want: true},
-		{name: "revoked wins", message: "rate limit response says token revoked", want: true},
-		{name: "reauth wins", message: "quota unavailable; reauthentication required", want: true},
+		// Generic auth-adjacent markers yield to benign quota/rate-limit/
+		// cooldown wording: CPA's native availability handling owns those.
+		{name: "revoked yields to rate-limit wording", message: "rate limit response says token revoked", want: false},
+		{name: "reauth yields to quota wording", message: "quota unavailable; reauthentication required", want: false},
+		// Generic markers without benign wording still quarantine.
+		{name: "revoked alone", message: "token revoked", want: true},
+		{name: "reauth alone", message: "reauthentication required", want: true},
 		{name: "quota alone", message: "quota exceeded with HTTP 429 cooldown", want: false},
 		{name: "rate limit alone", message: "rate limit overloaded", want: false},
 		{name: "numeric substring 401", message: "request 14031 failed temporarily", want: false},

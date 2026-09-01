@@ -14,6 +14,7 @@ var testNow = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 // captureDoer records the request and returns a canned response.
 type captureDoer struct {
 	lastReq hostapi.HTTPRequest
+	calls   int
 	status  int
 	body    string
 	err     error
@@ -21,6 +22,7 @@ type captureDoer struct {
 
 func (d *captureDoer) HTTPDo(ctx context.Context, req hostapi.HTTPRequest) (hostapi.HTTPResponse, error) {
 	d.lastReq = req
+	d.calls++
 	if d.err != nil {
 		return hostapi.HTTPResponse{}, d.err
 	}
@@ -116,6 +118,30 @@ func TestClaudeMissingSevenDayIsNotWeekly(t *testing.T) {
 		if obs.HasWeekly {
 			t.Errorf("%s: HasWeekly = true, want false", name)
 		}
+	}
+}
+
+func TestClaudeModelScopedWeeklyOnlyIsNotWeekly(t *testing.T) {
+	// Model-scoped weekly windows (seven_day_opus, seven_day_sonnet, ...) must
+	// never substitute for the regular account-wide seven_day window, even
+	// when they carry perfectly parseable future reset timestamps.
+	doer := &captureDoer{body: `{
+		"five_hour": {"utilization": 12, "resets_at": "2026-09-01T13:00:00Z"},
+		"seven_day_opus": {"utilization": 55, "resets_at": "2026-09-03T00:00:00Z"},
+		"seven_day_sonnet": {"utilization": 31, "resets_at": "2026-09-04T00:00:00Z"}
+	}`}
+	obs, err := NewClaude(doer, nowFn).FetchWeeklyReset(context.Background(), Credentials{AccessToken: "tok"})
+	if err != nil {
+		t.Fatalf("FetchWeeklyReset: %v", err)
+	}
+	if obs.HasWeekly {
+		t.Errorf("model-scoped weekly window accepted as the regular weekly window: HasWeekly = true")
+	}
+	if !obs.ResetAt.IsZero() {
+		t.Errorf("ResetAt = %s, want zero (no regular weekly window)", obs.ResetAt)
+	}
+	if !obs.ObservedAt.Equal(testNow) {
+		t.Errorf("ObservedAt = %s, want %s", obs.ObservedAt, testNow)
 	}
 }
 

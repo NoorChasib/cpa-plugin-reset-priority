@@ -43,11 +43,12 @@ const (
 
 // Host callback method names (plugin -> host).
 const (
-	MethodHostAuthList = "host.auth.list"
-	MethodHostAuthGet  = "host.auth.get"
-	MethodHostAuthSave = "host.auth.save"
-	MethodHostHTTPDo   = "host.http.do"
-	MethodHostLog      = "host.log"
+	MethodHostAuthList       = "host.auth.list"
+	MethodHostAuthGet        = "host.auth.get"
+	MethodHostAuthGetRuntime = "host.auth.get_runtime"
+	MethodHostAuthSave       = "host.auth.save"
+	MethodHostHTTPDo         = "host.http.do"
+	MethodHostLog            = "host.log"
 )
 
 // Envelope is the common RPC result wrapper used in both directions.
@@ -171,6 +172,7 @@ type AuthEntry struct {
 	Email         string    `json:"email,omitempty"`
 	Priority      int       `json:"priority,omitempty"`
 	LastRefresh   time.Time `json:"last_refresh,omitempty"`
+	ModTime       time.Time `json:"mod_time,omitempty"`
 }
 
 // AuthListResponse is the host.auth.list result.
@@ -178,9 +180,24 @@ type AuthListResponse struct {
 	Files []AuthEntry `json:"files"`
 }
 
-// AuthGetRequest is the host.auth.get request.
+// AuthGetRequest is the host.auth.get / host.auth.get_runtime request (both
+// audited callbacks take the same single auth_index field).
 type AuthGetRequest struct {
 	AuthIndex string `json:"auth_index"`
+}
+
+// AuthGetRuntimeResponse is the host.auth.get_runtime result. The audited
+// host resolves the index against the in-memory auth manager and returns the
+// same untrusted-metadata entry shape as host.auth.list, wrapped in an "auth"
+// key. It carries runtime health only (status, status_message, disabled,
+// unavailable, ...) and never credential JSON. Audited caveats:
+//   - the host returns an RPC error, not an empty entry, when the auth index
+//     is unknown, when the auth is runtime-only and disabled, or when a
+//     disabled/removed file-backed auth's physical file has disappeared;
+//   - Priority uses omitempty upstream, so zero remains ambiguous exactly as
+//     in list entries and must not be treated as an exact physical value.
+type AuthGetRuntimeResponse struct {
+	Auth AuthEntry `json:"auth"`
 }
 
 // AuthGetResponse is the host.auth.get result carrying the complete physical

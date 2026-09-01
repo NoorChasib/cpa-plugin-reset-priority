@@ -38,12 +38,18 @@ const (
 	HealthHealthy Health = "healthy"
 	// HealthQuarantined: definitively not a usable credential (disabled or
 	// reauth-required). Excluded from the rank count; desired priority is
-	// the quarantine sentinel.
+	// the quarantine sentinel, which is persisted to the physical auth JSON
+	// at quarantine time (see performWrites for the accepted save-side runtime
+	// rebuild tradeoff). While quarantined, the
+	// short-cadence health poll watches host.auth.get_runtime for CPA
+	// self-recovery.
 	HealthQuarantined Health = "quarantined"
 	// HealthRecovering: CPA reports the credential healthy again, but no
 	// FRESH post-recovery future weekly reset has been confirmed yet. Stays
 	// at the quarantine priority so stale pre-failure data cannot promote
-	// it (spec section 6A.4).
+	// it (spec section 6A.4). The health poll watches for regression to
+	// quarantined while the bounded recovery retries pursue a fresh
+	// observation.
 	HealthRecovering Health = "recovering"
 )
 
@@ -64,10 +70,15 @@ type account struct {
 	// blocked until recoverySentinelReady confirms the physical sentinel write.
 	recoveredAt           time.Time
 	recoverySentinelReady bool
-	fetchEpoch            uint64
-	nextFetchSeq          uint64
-	latestStartedFetchSeq uint64
-	latestWeeklyFetchSeq  uint64
+	// quarantineSentinelWrittenAt is set only after this plugin successfully
+	// saves the sentinel. The audited host rebuilds that runtime record as active,
+	// so an apparent recovery must carry refresh/file evidence newer than this
+	// instant before it is trusted.
+	quarantineSentinelWrittenAt time.Time
+	fetchEpoch                  uint64
+	nextFetchSeq                uint64
+	latestStartedFetchSeq       uint64
+	latestWeeklyFetchSeq        uint64
 
 	resetAt       time.Time
 	resetState    ResetState
@@ -115,6 +126,20 @@ func (a *account) hasFutureReset(now time.Time) bool {
 	return a.resetAt.After(now)
 }
 
+// hasPostSentinelRecoveryEvidence distinguishes genuine CPA/operator recovery
+// from the audited host.auth.save side effect that rebuilds a just-quarantined
+// runtime record as active. A plugin-written sentinel records its completion
+// time; only a later token refresh or physical-file modification may clear that
+// guard. If no sentinel save occurred (dry-run, failed save, or a pre-existing
+// physical sentinel), ordinary runtime health classification remains sufficient.
+func (a *account) hasPostSentinelRecoveryEvidence(entry hostapi.AuthEntry) bool {
+	writtenAt := a.quarantineSentinelWrittenAt
+	if writtenAt.IsZero() {
+		return true
+	}
+	return entry.LastRefresh.After(writtenAt) || entry.ModTime.After(writtenAt)
+}
+
 // cancelRetriesLocked invalidates and stops any scheduled bounded retries.
 func (a *account) cancelRetriesLocked() {
 	a.retrySeq++
@@ -128,11 +153,17 @@ func (a *account) cancelRetriesLocked() {
 //
 // Narrow by design (spec sections 6A.1, 6A.2, 6A.6):
 //   - disabled credentials are quarantined;
-//   - StatusError with an auth-specific message (unauthorized,
-//     invalid_grant, reauth, revoked, 401/403) is quarantined;
-//   - Unavailable alone, quota/cooldown/429 states, and generic transient
-//     errors are NOT quarantined — CPA's native availability handling owns
-//     those.
+//   - a StatusError whose message carries a narrow definitive credential
+//     failure (unauthorized, invalid_grant) is quarantined even when quota
+//     wording appears in the same message;
+//   - a StatusError with benign quota/rate-limit/429/cooldown wording is NOT
+//     quarantined, even when a generic auth-adjacent marker (forbidden, 403,
+//     reauth, ...) appears alongside it — e.g. "quota exceeded (403
+//     forbidden)" is a transient availability state that CPA's native
+//     handling owns;
+//   - only then do generic auth markers (reauth, revoked, forbidden, bare
+//     401/403) quarantine;
+//   - Unavailable alone and generic transient errors are never quarantined.
 func quarantineReasonFor(entry hostapi.AuthEntry) (bool, string) {
 	if entry.Disabled || strings.EqualFold(entry.Status, "disabled") {
 		return true, "disabled"
@@ -142,11 +173,29 @@ func quarantineReasonFor(entry hostapi.AuthEntry) (bool, string) {
 	}
 
 	msg := strings.ToLower(entry.StatusMessage)
-	// Definitive authentication markers take precedence over any generic quota
-	// wording that may be included in the same CPA error message.
+	// Narrow definitive credential failures stay authoritative regardless of
+	// any quota wording included in the same CPA error message.
+	for _, definitive := range []string{"unauthorized", "invalid_grant", "invalid grant"} {
+		if strings.Contains(msg, definitive) {
+			return true, "reauth_required"
+		}
+	}
+
+	// Benign quota/rate-limit/cooldown wording wins over the broader generic
+	// auth markers below. A rate-limited request often carries incidental
+	// forbidden/403 phrasing; that is never a credential-health failure.
+	for _, benign := range []string{"quota", "rate limit", "rate-limit", "cooldown", "cool down", "overloaded"} {
+		if strings.Contains(msg, benign) {
+			return false, ""
+		}
+	}
+	if containsStandaloneCode(msg, "429") {
+		return false, ""
+	}
+
+	// Generic auth markers classify only when no benign wording is present.
 	for _, marker := range []string{
-		"unauthorized", "invalid_grant", "invalid grant", "reauth",
-		"re-auth", "authentication required", "invalid credential",
+		"reauth", "re-auth", "authentication required", "invalid credential",
 		"revoked", "forbidden",
 	} {
 		if strings.Contains(msg, marker) {
@@ -155,14 +204,6 @@ func quarantineReasonFor(entry hostapi.AuthEntry) (bool, string) {
 	}
 	if containsStandaloneCode(msg, "401") || containsStandaloneCode(msg, "403") {
 		return true, "reauth_required"
-	}
-
-	// Quota/rate-limit/cooldown wording alone is never a credential-health
-	// failure. CPA's native availability handling owns those transient states.
-	for _, benign := range []string{"quota", "rate limit", "rate-limit", "429", "cooldown", "cool down", "overloaded"} {
-		if strings.Contains(msg, benign) {
-			return false, ""
-		}
 	}
 	return false, ""
 }

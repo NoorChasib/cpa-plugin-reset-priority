@@ -164,6 +164,29 @@ func (b *Bridge) AuthGet(ctx context.Context, authIndex string) (AuthGetResponse
 	return resp, nil
 }
 
+// AuthGetRuntime fetches the current runtime health entry for one auth index
+// without touching credential JSON.
+//
+// Audited host behavior (CLIProxyAPI 81e1b5374f99c212f196f34956eeed964a46b8fa,
+// internal/pluginhost/auth_callbacks.go): the callback resolves the index by
+// iterating the core auth manager's list (brief internal manager locking, the
+// host mutex is only taken to read the manager pointer) and performs at most
+// one os.Stat; no lock is held across blocking I/O and the callback never
+// re-enters plugin code. It is therefore a fast local call like AuthGet and
+// runs synchronously on the caller's goroutine: it participates in the
+// in-flight gate and is drained during native shutdown. The host returns an
+// RPC error (not an empty entry) for unknown indexes and for disabled auths
+// whose physical file has disappeared, so callers must treat an error as
+// "no usable runtime observation", never as a health transition.
+func (b *Bridge) AuthGetRuntime(ctx context.Context, authIndex string) (AuthEntry, error) {
+	_ = ctx
+	var resp AuthGetRuntimeResponse
+	if err := b.call(MethodHostAuthGetRuntime, AuthGetRequest{AuthIndex: authIndex}, &resp); err != nil {
+		return AuthEntry{}, err
+	}
+	return resp.Auth, nil
+}
+
 // AuthSave persists a complete credential JSON document to the named auth
 // file. Callers must have re-read the document immediately before mutating
 // it, because host.auth.save is whole-document replacement.

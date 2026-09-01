@@ -26,14 +26,18 @@ type writeItem struct {
 // equals the desired priority; ambiguity (unknown current) forces a
 // read-and-verify pass, which still results in no save when the latest
 // physical value already matches.
+//
+// Quarantined accounts are planned like any other: the quarantine sentinel is
+// persisted to the physical auth JSON at
+// quarantine time, accepting the audited save/upsert transient-reactivation
+// tradeoff documented on performWrites. The read-latest / preserve-fields /
+// no-op-skip flow in writeOne still applies, so a sentinel that is already
+// physical never causes a save. With the default sentinel 0, the ambiguous
+// omitempty list value keeps currentKnown false, so steady-state quarantine
+// costs one read-and-verify per reconcile and zero saves.
 func (e *Engine) writePlanLocked() []writeItem {
 	var plan []writeItem
 	for _, acct := range e.accounts {
-		// Any definitive quarantine status makes host.auth.save unsafe because
-		// CPA's save/upsert path can reactivate the credential.
-		if acct.health == HealthQuarantined {
-			continue
-		}
 		if acct.currentKnown && acct.currentPriority == acct.desired {
 			continue
 		}
@@ -59,11 +63,19 @@ func (e *Engine) writePlanLocked() []writeItem {
 //     host.auth.get immediately before writing and ONLY the top-level
 //     "priority" field is mutated; every other field is preserved verbatim
 //     (values byte-for-byte via json.RawMessage).
-//   - The save-side upsert path can synthesize an active runtime record, so
-//     saving any credential CPA definitively reports as quarantined (disabled,
-//     unauthorized, revoked, reauth-required) could silently RE-ACTIVATE it.
-//     Quarantined credentials are therefore never written. A recovering auth
-//     becomes writable only after a later roster explicitly reports it healthy.
+//   - The audited save-side upsert path rebuilds the runtime record as
+//     Status=active / Disabled=false regardless of the prior runtime state,
+//     so saving a credential CPA definitively reports as quarantined
+//     (disabled, unauthorized, revoked, reauth-required) TRANSIENTLY
+//     re-activates its runtime record. The sentinel persistence requirement
+//     accepts that residual tradeoff in order to persist the sentinel to the
+//     physical JSON at quarantine time: the sentinel priority itself keeps
+//     the auth at the bottom of selection, the document's own fields
+//     (including any "disabled" key) are preserved verbatim for CPA's
+//     watcher/refresh cycle to re-establish the definitive state, and a
+//     reauth-required credential simply fails again on next use. The
+//     no-op-skip rule means this exposure occurs at most once per quarantine,
+//     not on every reconcile.
 //   - A failed save for one account never aborts the rest of the pass.
 //   - Dry-run performs zero host.auth.save calls (spec section 16).
 //   - Auth files are never read or written directly; only host callbacks.
@@ -85,7 +97,7 @@ func (e *Engine) performWrites(ctx context.Context, plan []writeItem) {
 		// Revalidate against live state under the state lock.
 		e.mu.Lock()
 		acct := e.accounts[item.authIndex]
-		if e.stopped || acct == nil || acct.desired != item.desired || acct.health != item.health || acct.health == HealthQuarantined {
+		if e.stopped || acct == nil || acct.desired != item.desired || acct.health != item.health {
 			e.mu.Unlock()
 			continue
 		}
@@ -100,8 +112,12 @@ func (e *Engine) performWrites(ctx context.Context, plan []writeItem) {
 				item.provider, item.name, item.desired))
 			continue
 		}
-		if item.disabled {
-			// Defensive backstop for inconsistent roster health fields.
+		if item.disabled && item.health != HealthQuarantined {
+			// Defensive backstop for inconsistent roster health fields: a
+			// disabled entry is always classified quarantined, so a disabled
+			// account carrying a non-sentinel plan means the classification and
+			// the plan disagree; skip rather than write a rank. The quarantine
+			// sentinel write itself deliberately proceeds.
 			e.logf("info", fmt.Sprintf(
 				"reset-priority: skipping unsafe priority write for disabled %s auth %s",
 				item.provider, item.name))
@@ -146,7 +162,7 @@ func (e *Engine) writeOne(ctx context.Context, item writeItem) {
 
 	if existing, ok := parsePriorityRaw(doc["priority"]); ok && existing == item.desired {
 		// Latest physical priority already matches: no write occurs.
-		e.updateCurrentPriority(item.authIndex, item.desired)
+		e.updateCurrentPriority(item.authIndex, item.desired, false)
 		return
 	}
 
@@ -168,7 +184,7 @@ func (e *Engine) writeOne(ctx context.Context, item writeItem) {
 		e.recordWriteError(item.authIndex, "save failed: "+shortErr(errSave))
 		return
 	}
-	e.updateCurrentPriority(item.authIndex, item.desired)
+	e.updateCurrentPriority(item.authIndex, item.desired, true)
 	e.logf("info", fmt.Sprintf(
 		"reset-priority: set priority of %s auth %s to %d", item.provider, name, item.desired))
 }
@@ -177,10 +193,10 @@ func (e *Engine) writeItemCurrent(item writeItem) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	acct := e.accounts[item.authIndex]
-	return !e.stopped && acct != nil && acct.desired == item.desired && acct.health == item.health && acct.health != HealthQuarantined
+	return !e.stopped && acct != nil && acct.desired == item.desired && acct.health == item.health
 }
 
-func (e *Engine) updateCurrentPriority(authIndex string, priority int) {
+func (e *Engine) updateCurrentPriority(authIndex string, priority int, saved bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if acct := e.accounts[authIndex]; acct != nil {
@@ -188,6 +204,9 @@ func (e *Engine) updateCurrentPriority(authIndex string, priority int) {
 		acct.currentKnown = true
 		if acct.health == HealthRecovering && priority == e.cfg.QuarantinePriority {
 			acct.recoverySentinelReady = true
+		}
+		if saved && acct.health == HealthQuarantined && priority == e.cfg.QuarantinePriority {
+			acct.quarantineSentinelWrittenAt = e.clk.Now()
 		}
 		acct.writeError = ""
 	}

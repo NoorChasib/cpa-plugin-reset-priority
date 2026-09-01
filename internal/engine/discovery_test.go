@@ -90,7 +90,7 @@ func TestDiscoveryRemovalContractsPriorities(t *testing.T) {
 	}
 }
 
-func TestDiscoveryDisabledAccountQuarantinedAtZeroAndNeverSaved(t *testing.T) {
+func TestDiscoveryDisabledAccountQuarantinedAtZeroAndSentinelPersisted(t *testing.T) {
 	env := newTestEnv(t, defaultConfig())
 	env.addAccount("claude", "a", day(1))
 	env.addAccount("claude", "b", day(2))
@@ -106,12 +106,13 @@ func TestDiscoveryDisabledAccountQuarantinedAtZeroAndNeverSaved(t *testing.T) {
 	if row.Health != "quarantined" || row.QuarantineReason != "disabled" {
 		t.Errorf("account a health = %s (%s), want quarantined (disabled)", row.Health, row.QuarantineReason)
 	}
-	// host.auth.save on a disabled credential could re-enable it (upstream
-	// FileTokenStore rewrites metadata disabled from the simplified runtime
-	// record); the plugin must never write disabled credentials.
-	if saves := env.host.savesFor("a.json"); len(saves) != 0 {
-		t.Errorf("disabled account a was saved %d times, want 0", len(saves))
+	// The sentinel is persisted to the physical auth JSON at quarantine time
+	// despite the audited save/upsert reactivation
+	// tradeoff, so CPA's selector sees the demotion in the file itself.
+	if saves := env.host.savesFor("a.json"); len(saves) != 1 {
+		t.Fatalf("disabled account a was saved %d times, want 1 sentinel write", len(saves))
 	}
+	env.assertPhysical(map[string]int{"a": 0, "b": 100})
 }
 
 func TestDiscoveryReauthRequiredQuarantined(t *testing.T) {
@@ -158,6 +159,118 @@ func TestDiscoveryQuotaCooldownDoesNotQuarantineOrRerank(t *testing.T) {
 	})
 	env.reconcile()
 	env.assertDesired(map[string]int{"a": 200, "b": 100})
+
+	// Quota wording with an incidental generic auth marker (403/forbidden) is
+	// still a benign availability state, not a credential-health failure.
+	env.host.updateEntry("idx-a", func(e *hostapi.AuthEntry) {
+		e.Status = "error"
+		e.StatusMessage = "quota exceeded (403 forbidden)"
+	})
+	env.reconcile()
+	env.assertDesired(map[string]int{"a": 200, "b": 100})
+	row, _ = env.statusRow("a")
+	if row.Health != "healthy" {
+		t.Errorf("account a health = %s, want healthy for quota wording with incidental 403", row.Health)
+	}
+}
+
+func TestQuarantineClassificationPrecedence(t *testing.T) {
+	cases := []struct {
+		name       string
+		entry      hostapi.AuthEntry
+		wantQuar   bool
+		wantReason string
+	}{
+		{
+			name:     "benign quota with incidental forbidden",
+			entry:    hostapi.AuthEntry{Status: "error", StatusMessage: "quota exceeded (403 forbidden)"},
+			wantQuar: false,
+		},
+		{
+			name:     "429 with incidental forbidden",
+			entry:    hostapi.AuthEntry{Status: "error", StatusMessage: "429 too many requests: forbidden by rate limiter"},
+			wantQuar: false,
+		},
+		{
+			name:     "cooldown with incidental reauth wording",
+			entry:    hostapi.AuthEntry{Status: "error", StatusMessage: "rate-limit cooldown active, reauth not required"},
+			wantQuar: false,
+		},
+		{
+			name:     "overloaded alone",
+			entry:    hostapi.AuthEntry{Status: "error", StatusMessage: "upstream overloaded"},
+			wantQuar: false,
+		},
+		{
+			name:       "definitive unauthorized wins over quota wording",
+			entry:      hostapi.AuthEntry{Status: "error", StatusMessage: "unauthorized: quota state unknown"},
+			wantQuar:   true,
+			wantReason: "reauth_required",
+		},
+		{
+			name:       "definitive invalid_grant wins over quota wording",
+			entry:      hostapi.AuthEntry{Status: "error", StatusMessage: "invalid_grant while probing quota window"},
+			wantQuar:   true,
+			wantReason: "reauth_required",
+		},
+		{
+			name:       "definitive invalid grant with space",
+			entry:      hostapi.AuthEntry{Status: "error", StatusMessage: "oauth: invalid grant"},
+			wantQuar:   true,
+			wantReason: "reauth_required",
+		},
+		{
+			name:       "generic forbidden alone still quarantines",
+			entry:      hostapi.AuthEntry{Status: "error", StatusMessage: "forbidden"},
+			wantQuar:   true,
+			wantReason: "reauth_required",
+		},
+		{
+			name:       "generic revoked alone still quarantines",
+			entry:      hostapi.AuthEntry{Status: "error", StatusMessage: "token revoked"},
+			wantQuar:   true,
+			wantReason: "reauth_required",
+		},
+		{
+			name:       "incidental digits containing 429 are not rate limiting",
+			entry:      hostapi.AuthEntry{Status: "error", StatusMessage: "token revoked (trace 54297)"},
+			wantQuar:   true,
+			wantReason: "reauth_required",
+		},
+		{
+			name:       "bare 401 alone still quarantines",
+			entry:      hostapi.AuthEntry{Status: "error", StatusMessage: "HTTP 401"},
+			wantQuar:   true,
+			wantReason: "reauth_required",
+		},
+		{
+			name:       "disabled remains authoritative over everything",
+			entry:      hostapi.AuthEntry{Disabled: true, Status: "error", StatusMessage: "quota exceeded"},
+			wantQuar:   true,
+			wantReason: "disabled",
+		},
+		{
+			name:     "error status with empty message",
+			entry:    hostapi.AuthEntry{Status: "error"},
+			wantQuar: false,
+		},
+		{
+			name:     "non-error status ignores auth wording",
+			entry:    hostapi.AuthEntry{Status: "active", StatusMessage: "unauthorized"},
+			wantQuar: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			quarantined, reason := quarantineReasonFor(tc.entry)
+			if quarantined != tc.wantQuar {
+				t.Fatalf("quarantined = %v, want %v (message %q)", quarantined, tc.wantQuar, tc.entry.StatusMessage)
+			}
+			if reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", reason, tc.wantReason)
+			}
+		})
+	}
 }
 
 func TestDiscoveryOneHealthyPlusOneQuarantinedLeavesFloor(t *testing.T) {
@@ -189,10 +302,7 @@ func TestRecoveryRequiresFreshFutureObservation(t *testing.T) {
 
 	// CPA reports it healthy again, but the quota endpoint still fails:
 	// the account must stay out of the pool (recovering, priority 0).
-	env.host.updateEntry("idx-a", func(e *hostapi.AuthEntry) {
-		e.Status = "active"
-		e.StatusMessage = ""
-	})
+	recoverAccount(env, "idx-a")
 	env.claude.setErr(token("a"), errFake("usage endpoint unavailable"))
 	env.reconcile()
 	env.assertDesired(map[string]int{"a": 0, "b": 100})
@@ -231,10 +341,7 @@ func TestRecoveryStalePreFailureResetCannotReenter(t *testing.T) {
 
 	// Recovery: CPA healthy again, but the provider still reports the
 	// EXPIRED pre-failure reset. The account must not re-enter the pool.
-	env.host.updateEntry("idx-a", func(e *hostapi.AuthEntry) {
-		e.Status = "active"
-		e.StatusMessage = ""
-	})
+	recoverAccount(env, "idx-a")
 	env.claude.setReset(token("a"), staleReset)
 	env.reconcile()
 	env.assertDesired(map[string]int{"a": 0, "b": 100})
@@ -260,10 +367,7 @@ func TestRecoveryRetriesFollowBoundedSchedule(t *testing.T) {
 	})
 	env.reconcile()
 
-	env.host.updateEntry("idx-a", func(e *hostapi.AuthEntry) {
-		e.Status = "active"
-		e.StatusMessage = ""
-	})
+	recoverAccount(env, "idx-a")
 	env.claude.setErr(token("a"), errFake("still failing"))
 	env.reconcile()
 	calls := env.claude.callCount(token("a"))
@@ -293,11 +397,18 @@ func TestRecoveryRetriesFollowBoundedSchedule(t *testing.T) {
 func TestDiscoveryUnrelatedProviderUntouched(t *testing.T) {
 	env := newTestEnv(t, defaultConfig())
 	env.addAccount("claude", "a", day(1))
+	// The fixture must be a physical file-backed entry: otherwise the
+	// source/path gate would filter it before the provider filter is ever
+	// exercised.
 	env.host.setEntry(hostapi.AuthEntry{
 		AuthIndex: "idx-gemini",
+		ID:        "id-gemini",
 		Name:      "gemini.json",
 		Provider:  "gemini",
+		Type:      "gemini",
 		Status:    "active",
+		Source:    "file",
+		Path:      "/auth/gemini.json",
 	}, map[string]any{"type": "gemini", "access_token": "tok-gemini", "priority": 7})
 	env.reconcile()
 

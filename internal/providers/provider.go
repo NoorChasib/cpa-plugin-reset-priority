@@ -104,9 +104,9 @@ func ExtractCredentials(providerID string, doc json.RawMessage) (Credentials, er
 }
 
 // accountIDFromIDToken best-effort decodes a JWT payload to recover the
-// ChatGPT account ID. Malformed tokens simply yield "" — the usage request
-// is then sent without the account header. No claim is validated or trusted
-// for anything beyond this single routing header.
+// ChatGPT account ID. Malformed tokens simply yield "" — the Codex provider
+// then fails closed before any HTTP is attempted. No claim is validated or
+// trusted for anything beyond this single routing header.
 func accountIDFromIDToken(idToken string) string {
 	parts := strings.Split(idToken, ".")
 	if len(parts) < 2 {

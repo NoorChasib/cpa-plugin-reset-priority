@@ -17,6 +17,12 @@ import (
 // codexUsageURL is the ChatGPT/Codex usage probe endpoint.
 const codexUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 
+// codexUserAgent is the CLI-shaped User-Agent sent with wham/usage requests.
+// The ChatGPT backend expects Codex CLI-style clients on this endpoint;
+// requests without a CLI-shaped User-Agent may be rejected by edge filtering.
+// The comment segment honestly identifies this plugin as the actual caller.
+const codexUserAgent = "codex_cli_rs/0.0.0 (cpa-plugin-reset-priority)"
+
 // weeklyWindowSeconds identifies the regular weekly quota window. The window
 // is identified strictly by its duration semantics, never by array/object
 // position (spec section 2.2).
@@ -41,17 +47,22 @@ func (c *Codex) ID() string { return "codex" }
 
 // FetchWeeklyReset implements Provider.
 func (c *Codex) FetchWeeklyReset(ctx context.Context, creds Credentials) (Observation, error) {
-	headers := map[string][]string{
-		"Authorization": {"Bearer " + creds.AccessToken},
-		"Accept":        {"application/json"},
-	}
-	if creds.AccountID != "" {
-		headers["Chatgpt-Account-Id"] = []string{creds.AccountID}
+	// Fail closed before any HTTP: the wham/usage endpoint requires the
+	// Chatgpt-Account-Id routing header, so an unresolvable account ID means
+	// the probe cannot succeed. The error is static and never echoes any
+	// credential material.
+	if creds.AccountID == "" {
+		return Observation{}, fmt.Errorf("codex account id could not be resolved from credentials")
 	}
 	resp, errDo := c.http.HTTPDo(ctx, hostapi.HTTPRequest{
-		Method:  "GET",
-		URL:     codexUsageURL,
-		Headers: headers,
+		Method: "GET",
+		URL:    codexUsageURL,
+		Headers: map[string][]string{
+			"Authorization":      {"Bearer " + creds.AccessToken},
+			"Accept":             {"application/json"},
+			"User-Agent":         {codexUserAgent},
+			"Chatgpt-Account-Id": {creds.AccountID},
+		},
 	})
 	if errDo != nil {
 		return Observation{}, fmt.Errorf("codex usage request failed: %w", errDo)
