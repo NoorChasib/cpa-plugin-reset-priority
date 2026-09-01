@@ -1,0 +1,53 @@
+# Merge this example into your existing CLIProxyAPI config.yaml.
+# Do not replace unrelated routing, auth, logging, model, or management settings.
+
+# Recommended for the plugin's hard-priority policy. If this already exists,
+# keep the operator's existing routing section and change only with intent.
+routing:
+  strategy: "fill-first"
+
+plugins:
+  enabled: true
+  dir: "plugins"
+
+  # Custom registry for this plugin. The built-in official registry remains
+  # available. Remove this source after moving to an official-store entry.
+  store-sources:
+    - "https://raw.githubusercontent.com/NoorChasib/cpa-plugin-reset-priority/main/registry.json"
+
+  configs:
+    reset-priority:
+      enabled: true
+
+      # CPA plugin registration/load priority. This is NOT an OAuth credential
+      # priority and is not used by the reset-ranking algorithm.
+      priority: 10
+
+      # Full safety reconciliation. Exact reset deadlines use independent timers.
+      reconcile-interval: 1h
+      request-timeout: 10s
+
+      # Healthy credential priorities: 100, 200, 300, ...
+      priority-floor: 100
+      priority-step: 100
+
+      # Managed credentials outside the active pool: disabled, reauth-required,
+      # or recovering without a fresh post-recovery weekly reset observation.
+      quarantine-priority: 0
+
+      manage-claude: true
+      manage-codex: true
+
+      # Required first-install posture. Change to false only after status and logs
+      # show the expected ordering for every real account.
+      dry-run: true
+
+      # v0.1.0 does not perform active Codex reset-window activation. Setting
+      # this true is accepted but ignored with a warning; passive reads/retries
+      # remain enabled.
+      codex-reset-window-activation: false
+
+      # Equivalent provider-selection alias, if preferred instead of manage-*:
+      # providers:
+      #   - claude
+      #   - codex
