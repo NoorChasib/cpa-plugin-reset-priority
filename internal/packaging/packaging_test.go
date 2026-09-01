@@ -43,11 +43,22 @@ func TestArchiveNamesMatchStoreExpectations(t *testing.T) {
 	if _, err := ArchiveName(plugin.PluginID, "v0.1.0", "linux", "amd64"); err == nil {
 		t.Errorf("ArchiveName accepted a version with leading v")
 	}
+	for _, platform := range [][2]string{
+		{"linux", "386"},
+		{"linux", "riscv64"},
+		{"darwin", "386"},
+		{"windows", "arm64"},
+		{"freebsd", "amd64"},
+	} {
+		if _, err := ArchiveName(plugin.PluginID, plugin.PluginVersion, platform[0], platform[1]); err == nil {
+			t.Errorf("ArchiveName accepted undocumented release platform %s/%s", platform[0], platform[1])
+		}
+	}
 }
 
 func TestLibraryBasenames(t *testing.T) {
 	// Spec section 28.2 exact ZIP-root library names.
-	cases := map[string]string{"linux": "reset-priority.so", "darwin": "reset-priority.dylib", "windows": "reset-priority.dll", "freebsd": "reset-priority.so"}
+	cases := map[string]string{"linux": "reset-priority.so", "darwin": "reset-priority.dylib", "windows": "reset-priority.dll"}
 	for goos, want := range cases {
 		got, err := LibraryBasename(plugin.PluginID, goos)
 		if err != nil {
@@ -59,6 +70,34 @@ func TestLibraryBasenames(t *testing.T) {
 	}
 	if _, err := LibraryBasename(plugin.PluginID, "plan9"); err == nil {
 		t.Errorf("unsupported GOOS accepted")
+	}
+}
+
+// TestLibraryExtensionMatchesDocumentedReleaseTargets pins the extension table
+// to the release matrix so the two cannot drift. README.md and docs/release.md
+// both document FreeBSD as a non-target, and ReleasePlatforms omits it, yet a
+// GOOS accepted here is a GOOS the packager will happily build an archive for.
+func TestLibraryExtensionMatchesDocumentedReleaseTargets(t *testing.T) {
+	targets := make(map[string]bool, len(ReleasePlatforms))
+	for _, platform := range ReleasePlatforms {
+		targets[platform.GOOS] = true
+		if _, err := LibraryExtension(platform.GOOS); err != nil {
+			t.Errorf("documented release target %s rejected: %v", platform, err)
+		}
+	}
+	if targets["freebsd"] {
+		t.Fatalf("ReleasePlatforms unexpectedly contains freebsd")
+	}
+	// CGO c-shared artifacts are never cross-compiled, so a GOOS with no
+	// release runner must fail loudly instead of naming a library that is
+	// never built or published.
+	for _, goos := range []string{"freebsd", "plan9", "netbsd", "openbsd", "android", "ios", "solaris", "js", "", "Linux"} {
+		if _, err := LibraryExtension(goos); err == nil {
+			t.Errorf("LibraryExtension(%q) accepted a GOOS that is not a release target", goos)
+		}
+		if _, err := LibraryBasename(plugin.PluginID, goos); err == nil {
+			t.Errorf("LibraryBasename(%q) accepted a GOOS that is not a release target", goos)
+		}
 	}
 }
 

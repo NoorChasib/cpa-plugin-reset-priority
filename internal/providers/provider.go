@@ -184,15 +184,28 @@ func parseRFC3339Timestamp(raw any) (time.Time, bool) {
 	return t, true
 }
 
-// firstKey returns the first present key from a decoded JSON object,
+// firstParsed returns the first value among keys that parse accepts,
 // supporting snake_case and camelCase alternates.
-func firstKey(obj map[string]any, keys ...string) (any, bool) {
+//
+// Every alias is tried rather than only the first one present: a key that is
+// absent, wrong-typed, or otherwise unparseable declares nothing, so it must
+// never shadow a sibling spelling that does carry a usable value. Providers
+// have been observed emitting both spellings of a field with only one of them
+// populated correctly, and stopping at the first present key would silently
+// discard the usable one. This is the same all-aliases rule firstStringField
+// applies to credential fields.
+func firstParsed[T any](obj map[string]any, parse func(any) (T, bool), keys ...string) (T, bool) {
 	for _, k := range keys {
-		if v, ok := obj[k]; ok && v != nil {
-			return v, true
+		v, ok := obj[k]
+		if !ok || v == nil {
+			continue
+		}
+		if parsed, okParse := parse(v); okParse {
+			return parsed, true
 		}
 	}
-	return nil, false
+	var zero T
+	return zero, false
 }
 
 // asObject narrows a decoded JSON value to an object.

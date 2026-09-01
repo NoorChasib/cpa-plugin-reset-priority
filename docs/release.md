@@ -138,7 +138,7 @@ Against the target CPA deployment:
 2. install the candidate plugin;
 3. set `dry-run: true`;
 4. restart/reload CPA;
-5. trigger authenticated `POST /v0/management/plugins/reset-priority/refresh`;
+5. trigger authenticated `POST /v0/management/plugins/reset-priority/refresh` with `X-Reset-Priority-Refresh: 1`;
 6. complete the README operator checklist;
 7. verify Claude uses only `seven_day.resets_at`;
 8. verify Codex uses only the exact `604800`-second weekly window;

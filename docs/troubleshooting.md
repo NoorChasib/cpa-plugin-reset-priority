@@ -63,7 +63,7 @@ Do not post complete debug logs without reviewing them for unrelated secrets.
   GET  /v0/resource/plugins/reset-priority/status
   ```
 
-- The management routes require CPA management authentication.
+- The management routes require CPA management authentication. Refresh POSTs additionally require `X-Reset-Priority-Refresh: 1`. Browser requests are accepted only with `Sec-Fetch-Site: same-origin` or `none`; `same-site`, `cross-site`, invalid/empty metadata, and `Origin` without fetch metadata are rejected. Non-browser clients may omit browser metadata.
 - The resource route is a static, account-free readiness shell and is read-only and unauthenticated under CPA's resource model.
 - Restart CPA after first installing a native library.
 
@@ -198,20 +198,26 @@ Set `dry-run: false` only after the computed order is accepted, then restart/rec
 
 This separation is intentional:
 
-- `POST /v0/management/plugins/reset-priority/refresh` is authenticated and mutating.
-- `GET /v0/management/plugins/reset-priority/status/html` is the authenticated browser status view; its Refresh now button makes a same-origin call to the authenticated refresh route and preserves the query string.
+- `POST /v0/management/plugins/reset-priority/refresh` is authenticated and mutating. It requires `X-Reset-Priority-Refresh: 1`. Browser requests are allowed only with `Sec-Fetch-Site: same-origin` or `none`; the route rejects `same-site`, `cross-site`, invalid/empty metadata, and `Origin` without fetch metadata. Non-browser clients may omit both `Origin` and fetch metadata.
+- `GET /v0/management/plugins/reset-priority/status/html` is the authenticated browser status view; its Refresh now button makes a same-origin call to the authenticated refresh route, sets the required plugin CSRF header, and preserves the query string.
 - `GET /v0/resource/plugins/reset-priority/status` is an unauthenticated, read-only, static readiness shell with no account-level details.
 
-Query parameters sent to either route are not management credentials; parameters on the resource route are inert. At the audited CPA revision, management authentication is accepted only through `Authorization: Bearer ...` or `X-Management-Key`, so ordinary address-bar navigation cannot authenticate the HTML route. Use a browser/profile or authenticated reverse proxy that supplies the header to both the page GET and same-origin refresh POST. If that is unavailable, use the authenticated JSON route and `curl`. Never expose mutation or operational account data through the resource route.
+Query parameters sent to either route are not management credentials; parameters on the resource route are inert. At the audited CPA revision, management authentication is accepted only through `Authorization: Bearer ...` or `X-Management-Key`, so ordinary address-bar navigation cannot authenticate the HTML route. Use a browser/profile or authenticated reverse proxy that supplies the management header to both the page GET and same-origin refresh POST. A proxy that injects that credential ambiently must also enforce CSRF/origin protection for every Management API route, must not add `X-Reset-Priority-Refresh` to arbitrary inbound requests, and must preserve `Sec-Fetch-Site`. CPA's audited broad CORS handling can approve a same-site sibling's preflight and custom header, so the plugin accepts browser refreshes only when fetch metadata says `same-origin` or `none`; merely requiring the custom header or rejecting only `cross-site` is insufficient. The plugin gate still does not protect other CPA management endpoints. If browser authentication is unavailable, use the authenticated JSON route and `curl` with both the management header and `X-Reset-Priority-Refresh: 1`. Never expose mutation or operational account data through the resource route.
 
 ## Provider request failures
 
-The plugin uses CPA's proxy-aware `host.http.do` callback with a per-request timeout (default `10s`). It never logs provider bodies or authorization headers.
+The plugin uses CPA's proxy-aware `host.http.do` callback with a per-request timeout (default `10s`). Provider callbacks caused by Management Refresh carry the request's CPA `host_callback_id`, so CPA can bind provider HTTP to the originating management context while that ID remains registered. A callback worker that observes cancellation before native dispatch does not enter CPA. ABI v1 has no post-resolution acknowledgement or callback-context lease, however: in the narrow race where management unwinds after dispatch commits but before CPA resolves the ID, the audited host treats the now-unknown ID as a background context. The 64-callback cap contains accumulation but cannot cancel that already-entered callback. It never logs provider bodies or authorization headers.
 
 - Claude uses `https://api.anthropic.com/api/oauth/usage` and reads only `seven_day.resets_at`.
 - Codex uses `https://chatgpt.com/backend-api/wham/usage` with a Codex-CLI-shaped `User-Agent`, requires a resolved ChatGPT account ID for `Chatgpt-Account-Id`, and reads only a window declared as exactly `604800` seconds/`10080` minutes. If the account ID is absent from credential metadata and cannot be recovered from the ID token, the probe fails before HTTP rather than making an unscoped usage request.
 
 Check outbound connectivity/proxy configuration and OAuth health in CPA. A single timeout, network failure, 5xx, account-ID resolution failure, or telemetry schema error does not quarantine the auth; it leaves the weekly reset unknown/stale and surfaces a sanitized provider warning.
+
+## Status or logs report `host callback limit reached`
+
+The plugin caps native host callbacks at 64 in flight across the process. This is a fault-containment limit, not a normal throughput setting: the engine normally needs four concurrent provider callbacks plus a small number of short local auth/log callbacks.
+
+`host callback limit reached` means earlier callbacks entered CPA and have not returned, commonly because provider HTTP is stuck behind broken network/proxy behavior after the plugin-side timeout ended. New callbacks fail fast rather than adding more blocked cgo calls and OS threads. Check CPA/proxy connectivity and host-side HTTP timeouts, stop forcing Refresh, and restart CPA after correcting the underlying problem. Do not increase the limit to hide callbacks that never return. Terminal unload may still wait for the already-entered finite set, as described below.
 
 ## Release archive or checksum validation fails
 
@@ -248,9 +254,9 @@ A same-path native unload/reinstall (or remove-then-install) always requires a C
 
 ## Plugin unload or CPA shutdown hangs while draining the plugin
 
-At ABI v1, host callbacks carry no cancellation. During terminal native shutdown the plugin must wait for every host callback that already entered the host (including a `host.http.do` whose plugin-side request timeout already expired) to fully return before the host may release the host API table and unload the library. Abandoning such a callback on a plugin-side timer would risk a use-after-free crash inside CPA during unload, so the plugin deliberately implements no bounded drain.
+At ABI v1, native host callback entry carries no direct cancellation primitive. During terminal native shutdown the plugin must wait for every host callback that already entered the host (including a `host.http.do` whose plugin-side request timeout already expired) to fully return before the host may release the host API table and unload the library. Abandoning such a callback on a plugin-side timer would risk a use-after-free crash inside CPA during unload, so the plugin deliberately implements no bounded drain.
 
-Consequence at the audited CPA revision: if a host callback never returns (for example an upstream HTTP request with no effective host-side deadline through a broken proxy), plugin shutdown blocks inside CPA's unload path until the CPA process itself exits. If an unload hangs, check outbound connectivity/proxy health and stop the CPA process; this is a current-host/ABI limitation, not plugin state corruption.
+The admitted set is bounded to 64 callbacks process-wide, and Management Refresh provider calls forward CPA's `host_callback_id` so the host can use the originating request context when the ID is resolved in time. These controls prevent unbounded accumulation and improve cancellation, but ABI v1 has no acknowledgement that CPA acquired the context before management can unwind. A callback crossing that narrow dispatch-to-resolution race can therefore lose request cancellation under the audited host's unknown-ID fallback, and no plugin-side code can force-return a callback already executing inside a misbehaving host. If one never returns (for example an upstream HTTP request with no effective host-side deadline through a broken proxy), plugin shutdown blocks inside CPA's unload path until the CPA process itself exits. If an unload hangs, check outbound connectivity/proxy health and stop the CPA process; this is a current-host/ABI limitation, not plugin state corruption.
 
 ## Smoke test
 

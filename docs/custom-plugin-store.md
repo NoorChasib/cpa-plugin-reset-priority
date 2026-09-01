@@ -130,6 +130,7 @@ curl --fail --silent --show-error \
 
 curl --fail --silent --show-error -X POST \
   -H "Authorization: Bearer ${CPA_MANAGEMENT_KEY}" \
+  -H "X-Reset-Priority-Refresh: 1" \
   "${CPA_BASE_URL}/v0/management/plugins/reset-priority/refresh"
 ```
 

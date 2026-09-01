@@ -7,6 +7,7 @@ package sanitize
 import (
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 const maxMessageLength = 240
@@ -36,9 +37,27 @@ func Message(s string) string {
 	s = longTokenPattern.ReplaceAllString(s, "[redacted]")
 	s = strings.TrimSpace(s)
 	if len(s) > maxMessageLength {
-		s = s[:maxMessageLength] + "..."
+		s = truncateToRuneBoundary(s, maxMessageLength) + "..."
 	}
 	return s
+}
+
+// truncateToRuneBoundary caps s at maxBytes bytes without splitting a
+// multi-byte rune. maxMessageLength is a byte budget, so a plain slice can cut
+// a UTF-8 sequence in half and emit invalid bytes into status pages,
+// management JSON responses, and host logs; backing up to the start of the
+// straddling rune drops at most three bytes instead.
+func truncateToRuneBoundary(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	// s[cut] is a continuation byte exactly while the cut lands inside a
+	// rune, so this walks back to the boundary that starts it.
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // Error scrubs an error for safe display and logging.

@@ -385,3 +385,108 @@ func TestCodexHTTPErrorIsSanitized(t *testing.T) {
 		t.Errorf("error leaks response body: %v", err)
 	}
 }
+
+func TestCodexAliasesAreAllTriedUntilAValidValue(t *testing.T) {
+	// Alias pairs must be scanned to exhaustion: an alias whose value is
+	// unusable (wrong type, unparseable, or out of bounds) carries no
+	// information and must never shadow a sibling alias that does carry the
+	// value. Stopping at the first *present* key silently drops a usable
+	// weekly reset and demotes the credential in the ranking.
+	want := time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC)
+	for name, window := range map[string]string{
+		"unparseable reset_at then valid resetAt": `
+			"limit_window_seconds": 604800,
+			"reset_at": "not-a-timestamp",
+			"resetAt": "2026-09-06T00:00:00Z"`,
+		"wrong-type reset_at then valid resetAt": `
+			"limit_window_seconds": 604800,
+			"reset_at": true,
+			"resetAt": "2026-09-06T00:00:00Z"`,
+		"implausible numeric reset_at then valid resetAt": `
+			"limit_window_seconds": 604800,
+			"reset_at": 1788523200000,
+			"resetAt": "2026-09-06T00:00:00Z"`,
+		"implausible RFC3339 reset_at then valid resetAt": `
+			"limit_window_seconds": 604800,
+			"reset_at": "9999-01-01T00:00:00Z",
+			"resetAt": "2026-09-06T00:00:00Z"`,
+		"wrong-type limit_window_seconds then valid window_minutes": `
+			"limit_window_seconds": "604800",
+			"window_minutes": 10080,
+			"reset_at": "2026-09-06T00:00:00Z"`,
+		"wrong-type limit_window_seconds then valid limitWindowSeconds": `
+			"limit_window_seconds": {"value": 604800},
+			"limitWindowSeconds": 604800,
+			"reset_at": "2026-09-06T00:00:00Z"`,
+		"non-integral limit_window_seconds then valid window_minutes": `
+			"limit_window_seconds": 604800.5,
+			"window_minutes": 10080,
+			"reset_at": "2026-09-06T00:00:00Z"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			obs, err := codexFetch(t, `{"rate_limit":{"secondary_window":{`+window+`}}}`)
+			if err != nil {
+				t.Fatalf("err=%v", err)
+			}
+			if !obs.HasWeekly {
+				t.Fatalf("HasWeekly = false: an unusable alias shadowed a valid one")
+			}
+			if !obs.ResetAt.Equal(want) {
+				t.Errorf("ResetAt = %s, want %s", obs.ResetAt, want)
+			}
+		})
+	}
+}
+
+func TestCodexResetAfterSecondsAliasesAreAllTried(t *testing.T) {
+	// The relative-offset alias pair has the same rule: a wrong-typed
+	// reset_after_seconds must not suppress a valid resetAfterSeconds.
+	obs, err := codexFetch(t, `{
+		"rate_limit": {
+			"secondary_window": {
+				"limit_window_seconds": 604800,
+				"reset_after_seconds": "3600",
+				"resetAfterSeconds": 3600
+			}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if !obs.HasWeekly {
+		t.Fatalf("HasWeekly = false: wrong-typed reset_after_seconds shadowed resetAfterSeconds")
+	}
+	if want := testNow.Add(time.Hour); !obs.ResetAt.Equal(want) {
+		t.Errorf("ResetAt = %s, want %s", obs.ResetAt, want)
+	}
+}
+
+func TestCodexFirstUsableDurationDeclarationDecides(t *testing.T) {
+	// Regression guard on the exhaustive alias scan: trying every alias must
+	// not degrade into "any alias declaring a week wins". Within one alias
+	// family the first USABLE value decides outright, and a family that
+	// resolves to a non-weekly duration is never overridden by a later
+	// family, so the five-hour window can never be promoted into the weekly
+	// slot by a contradicting sibling key (spec section 2.2).
+	for name, window := range map[string]string{
+		"five-hour seconds against weekly minutes": `
+			"limit_window_seconds": 18000,
+			"window_minutes": 10080`,
+		"five-hour snake_case against weekly camelCase": `
+			"limit_window_seconds": 18000,
+			"limitWindowSeconds": 604800`,
+		"five-hour minutes reached only because seconds are unusable": `
+			"limit_window_seconds": "bogus",
+			"window_minutes": 300`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			obs, err := codexFetch(t, `{"rate_limit":{"primary_window":{`+window+`,"reset_at":"2026-09-06T00:00:00Z"}}}`)
+			if err != nil {
+				t.Fatalf("err=%v", err)
+			}
+			if obs.HasWeekly {
+				t.Errorf("non-weekly duration declaration promoted to weekly (%s)", obs.ResetAt)
+			}
+		})
+	}
+}

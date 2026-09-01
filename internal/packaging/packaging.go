@@ -29,16 +29,22 @@ func ValidatePluginID(id string) error {
 }
 
 // LibraryExtension returns the shared-library extension for a GOOS.
+//
+// The accepted set is exactly the GOOS values in ReleasePlatforms. FreeBSD is
+// deliberately absent: README.md and docs/release.md both document it as a
+// non-target, no release job builds it, and these CGO c-shared libraries are
+// never cross-compiled, so naming a .so for it would only produce an artifact
+// that is never built, published, or checksummed.
 func LibraryExtension(goos string) (string, error) {
 	switch goos {
-	case "linux", "freebsd":
+	case "linux":
 		return ".so", nil
 	case "darwin":
 		return ".dylib", nil
 	case "windows":
 		return ".dll", nil
 	default:
-		return "", fmt.Errorf("unsupported GOOS %q", goos)
+		return "", fmt.Errorf("unsupported GOOS %q: not a release target", goos)
 	}
 }
 
@@ -55,9 +61,19 @@ func LibraryBasename(id, goos string) (string, error) {
 	return id + ext, nil
 }
 
+// ValidateReleasePlatform enforces the exact v0.1.0 native build matrix.
+func ValidateReleasePlatform(goos, goarch string) error {
+	switch goos + "/" + goarch {
+	case "linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64", "windows/amd64":
+		return nil
+	default:
+		return fmt.Errorf("unsupported release platform %q", goos+"/"+goarch)
+	}
+}
+
 // ArchiveName returns the required release ZIP name for GitHub-release
 // installs: <id>_<version>_<goos>_<goarch>.zip. Version must not carry a
-// leading v.
+// leading v, and the platform must be one of the five release targets.
 func ArchiveName(id, version, goos, goarch string) (string, error) {
 	if err := ValidatePluginID(id); err != nil {
 		return "", err
@@ -67,6 +83,9 @@ func ArchiveName(id, version, goos, goarch string) (string, error) {
 	}
 	if goos == "" || goarch == "" {
 		return "", fmt.Errorf("goos and goarch are required")
+	}
+	if err := ValidateReleasePlatform(goos, goarch); err != nil {
+		return "", err
 	}
 	return fmt.Sprintf("%s_%s_%s_%s.zip", id, version, goos, goarch), nil
 }

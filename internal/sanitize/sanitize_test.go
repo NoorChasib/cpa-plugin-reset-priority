@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestMessageRedactsBearerTokens(t *testing.T) {
@@ -66,5 +67,43 @@ func TestErrorNil(t *testing.T) {
 	}
 	if got := Error(errors.New("plain failure")); got != "plain failure" {
 		t.Errorf("Error = %q", got)
+	}
+}
+
+func TestMessageTruncationIsUTF8Safe(t *testing.T) {
+	// The length cap is a byte budget, so a naive s[:max] slice can cut a
+	// multi-byte rune in half and emit invalid UTF-8 into status pages,
+	// management JSON responses, and host logs. The single leading ASCII
+	// byte offsets the 3-byte runes so the cap lands inside a rune rather
+	// than on a boundary.
+	got := Message("x" + strings.Repeat("日", 200))
+	if !utf8.ValidString(got) {
+		t.Errorf("truncation produced invalid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Errorf("truncation marker missing: %q", got)
+	}
+	if len(got) > maxMessageLength+len("...") {
+		t.Errorf("truncated message is %d bytes, want at most %d", len(got), maxMessageLength+len("..."))
+	}
+}
+
+func TestMessageTruncationKeepsWholeRunes(t *testing.T) {
+	// Every rune that survives truncation must be intact: decoding the
+	// result must never yield the replacement character.
+	for name, input := range map[string]string{
+		"two-byte runes":   strings.Repeat("é", 400),
+		"three-byte runes": "x" + strings.Repeat("日", 200),
+		"four-byte runes":  "xy" + strings.Repeat("\U0001d11e", 200),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := Message(input)
+			if strings.ContainsRune(got, utf8.RuneError) {
+				t.Errorf("truncation split a rune: %q", got)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("truncation produced invalid UTF-8: %q", got)
+			}
+		})
 	}
 }

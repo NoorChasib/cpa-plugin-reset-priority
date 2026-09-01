@@ -138,54 +138,82 @@ func candidateWindows(root map[string]any) []map[string]any {
 	return out
 }
 
+// windowDurationAliases lists the duration declarations that identify a
+// window, in preference order. Each family groups the snake_case and camelCase
+// spellings of one declaration with the weekly duration expressed in that
+// family's own unit, so the comparison never needs a unit conversion.
+var windowDurationAliases = []struct {
+	keys []string
+	week int64
+}{
+	{keys: []string{"limit_window_seconds", "limitWindowSeconds"}, week: weeklyWindowSeconds},
+	{keys: []string{"window_minutes", "windowMinutes"}, week: weeklyWindowMinutes},
+}
+
 // isWeeklyWindow reports whether a window's declared duration is exactly one
-// week. A window without an explicit duration is never assumed to be weekly.
+// week.
+//
+// Families are consulted in order and, within a family, every spelling is
+// tried until one yields a usable number: a wrong-typed or non-integral value
+// declares nothing and must not shadow the sibling spelling or the next
+// family. The first usable value then decides outright, so a window that
+// genuinely declares a non-weekly duration still fails closed and the
+// five-hour window can never be promoted by a contradicting alias. A window
+// with no usable duration at all is never assumed to be weekly.
 func isWeeklyWindow(window map[string]any) bool {
-	if v, ok := firstKey(window, "limit_window_seconds", "limitWindowSeconds"); ok {
-		return exactIntegerEquals(v, weeklyWindowSeconds)
-	}
-	if v, ok := firstKey(window, "window_minutes", "windowMinutes"); ok {
-		return exactIntegerEquals(v, weeklyWindowMinutes)
+	for _, family := range windowDurationAliases {
+		if declared, ok := firstParsed(window, exactInteger, family.keys...); ok {
+			return declared.Cmp(big.NewRat(family.week, 1)) == 0
+		}
 	}
 	return false
 }
 
-// exactIntegerEquals compares a decoded JSON number to an integer without
-// rounding. Codex duration declarations must be finite, integral, and exactly
-// equal to the weekly duration; truncating a fractional value is forbidden.
-func exactIntegerEquals(raw any, want int64) bool {
+// exactInteger narrows a decoded JSON number to an exact integer without
+// rounding. Codex duration declarations must be finite and integral;
+// truncating a fractional value is forbidden. The result stays a big.Rat so
+// that an integral value too large for int64 remains a usable (merely
+// non-weekly) declaration rather than being mistaken for a missing one.
+func exactInteger(raw any) (*big.Rat, bool) {
 	v, ok := raw.(json.Number)
 	if !ok {
-		return false
+		return nil, false
 	}
 	n, ok := new(big.Rat).SetString(v.String())
-	return ok && n.IsInt() && n.Cmp(big.NewRat(want, 1)) == 0
+	if !ok || !n.IsInt() {
+		return nil, false
+	}
+	return n, true
 }
 
 // resetAtPlausibilitySlack absorbs modest provider/host clock disagreement
-// when bounding numeric reset_at values around the observation time.
+// when bounding absolute reset_at values around the observation time.
 const resetAtPlausibilitySlack = time.Hour
 
 // windowResetAt extracts the exact reset instant, preferring an absolute
 // reset_at timestamp and falling back to reset_after_seconds relative to the
 // observation time (spec section 8).
+//
+// Both alias families are scanned to exhaustion, so an unparseable or
+// implausible reset_at never suppresses a valid resetAt (nor a valid relative
+// offset); only the absence of any usable value in a family moves on to the
+// next one.
 func windowResetAt(window map[string]any, observedAt time.Time) (time.Time, bool) {
-	if v, ok := firstKey(window, "reset_at", "resetAt"); ok {
-		switch value := v.(type) {
+	parseAbsolute := func(raw any) (time.Time, bool) {
+		switch value := raw.(type) {
 		case string:
-			if t, okParse := parseRFC3339Timestamp(value); okParse {
-				return t, true
-			}
+			t, ok := parseRFC3339Timestamp(value)
+			return t, ok && plausibleResetAt(t, observedAt)
 		case json.Number:
-			if t, okParse := parseUnixSecondsResetAt(value, observedAt); okParse {
-				return t, true
-			}
+			return parseUnixSecondsResetAt(value, observedAt)
 		}
+		return time.Time{}, false
 	}
-	if v, ok := firstKey(window, "reset_after_seconds", "resetAfterSeconds"); ok {
-		if d, okDur := parseResetAfterSeconds(v); okDur {
-			return observedAt.Add(d), true
-		}
+	if t, ok := firstParsed(window, parseAbsolute, "reset_at", "resetAt"); ok {
+		return t, true
+	}
+	if d, ok := firstParsed(window, parseResetAfterSeconds, "reset_after_seconds", "resetAfterSeconds"); ok {
+		return observedAt.Add(d), true
 	}
 	return time.Time{}, false
 }
@@ -207,12 +235,16 @@ func parseUnixSecondsResetAt(num json.Number, observedAt time.Time) (time.Time, 
 	if err != nil {
 		return time.Time{}, false
 	}
-	const window = weeklyWindowSeconds*time.Second + resetAtPlausibilitySlack
 	t := time.Unix(sec, 0).UTC()
-	if t.Before(observedAt.Add(-window)) || t.After(observedAt.Add(window)) {
+	if !plausibleResetAt(t, observedAt) {
 		return time.Time{}, false
 	}
 	return t, true
+}
+
+func plausibleResetAt(resetAt, observedAt time.Time) bool {
+	const window = weeklyWindowSeconds*time.Second + resetAtPlausibilitySlack
+	return !resetAt.Before(observedAt.Add(-window)) && !resetAt.After(observedAt.Add(window))
 }
 
 // parseResetAfterSeconds validates a relative reset offset. Fractional
