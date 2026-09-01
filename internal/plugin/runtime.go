@@ -1,7 +1,7 @@
 // Package plugin implements the RPC-facing runtime: lifecycle dispatch
 // (register/reconfigure/quiesce/shutdown), management route registration,
-// and the authenticated status/refresh handlers plus the static read-only
-// browser resource shell.
+// the authenticated status (JSON and browser HTML) and refresh handlers,
+// plus the static read-only browser resource shell.
 package plugin
 
 import (
@@ -30,9 +30,10 @@ const (
 // Management/resource route paths (relative; the host prefixes
 // /v0/management and /v0/resource/plugins/<id> respectively).
 const (
-	managementStatusPath  = "/plugins/" + PluginID + "/status"
-	managementRefreshPath = "/plugins/" + PluginID + "/refresh"
-	resourceStatusPath    = "/status"
+	managementStatusPath     = "/plugins/" + PluginID + "/status"
+	managementStatusPagePath = "/plugins/" + PluginID + "/status/html"
+	managementRefreshPath    = "/plugins/" + PluginID + "/refresh"
+	resourceStatusPath       = "/status"
 )
 
 // Runtime dispatches host RPC calls and owns the engine lifecycle.
@@ -252,6 +253,11 @@ func managementRegistration() hostapi.ManagementRegistration {
 				Description: "Reset-priority status snapshot (JSON)",
 			},
 			{
+				Method:      "GET",
+				Path:        managementStatusPagePath,
+				Description: "Reset-priority status page (browser HTML)",
+			},
+			{
 				Method:      "POST",
 				Path:        managementRefreshPath,
 				Description: "Run a full reconciliation now",
@@ -294,10 +300,20 @@ func (r *Runtime) handleManagement(request []byte) []byte {
 	}
 
 	switch {
+	case method == "GET" && strings.HasSuffix(path, managementStatusPagePath) && !isResourcePath(path):
+		// Authenticated browser HTML status view. Renders only the published,
+		// sanitized snapshot through an auto-escaping template; the account
+		// label (which may carry an email) is never rendered.
+		page, errPage := renderManagementStatusPage(eng.Status())
+		if errPage != nil {
+			return okEnvelope(jsonResponse(500, map[string]string{"error": "render status page failed"}))
+		}
+		return okEnvelope(htmlResponse(200, page))
+
 	case method == "GET" && strings.HasSuffix(path, managementStatusPath) && !isResourcePath(path):
 		return okEnvelope(jsonResponse(200, eng.Status()))
 
-	case method == "POST" && strings.HasSuffix(path, managementRefreshPath):
+	case method == "POST" && strings.HasSuffix(path, managementRefreshPath) && !isResourcePath(path):
 		// Authenticated "Refresh now" action (spec section 15).
 		eng.Reconcile(context.Background(), "management-refresh")
 		return okEnvelope(jsonResponse(200, map[string]any{
@@ -337,16 +353,25 @@ func jsonResponse(status int, payload any) hostapi.ManagementResponse {
 	}
 	return hostapi.ManagementResponse{
 		StatusCode: status,
-		Headers:    map[string][]string{"Content-Type": {"application/json; charset=utf-8"}},
-		Body:       body,
+		Headers: map[string][]string{
+			"Content-Type":           {"application/json; charset=utf-8"},
+			"Cache-Control":          {"no-store"},
+			"X-Content-Type-Options": {"nosniff"},
+		},
+		Body: body,
 	}
 }
 
 func htmlResponse(status int, body []byte) hostapi.ManagementResponse {
 	return hostapi.ManagementResponse{
 		StatusCode: status,
-		Headers:    map[string][]string{"Content-Type": {"text/html; charset=utf-8"}},
-		Body:       body,
+		Headers: map[string][]string{
+			"Content-Type":            {"text/html; charset=utf-8"},
+			"Cache-Control":           {"no-store"},
+			"X-Content-Type-Options":  {"nosniff"},
+			"Content-Security-Policy": {"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"},
+		},
+		Body: body,
 	}
 }
 

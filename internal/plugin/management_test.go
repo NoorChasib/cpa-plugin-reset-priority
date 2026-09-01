@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NoorChasib/cpa-plugin-reset-priority/internal/engine"
 	"github.com/NoorChasib/cpa-plugin-reset-priority/internal/hostapi"
 )
 
@@ -34,8 +35,8 @@ func TestManagementRegistrationRouteCasing(t *testing.T) {
 	if err := json.Unmarshal(decoded["routes"], &routes); err != nil {
 		t.Fatal(err)
 	}
-	if len(routes) != 2 {
-		t.Fatalf("routes = %d, want 2", len(routes))
+	if len(routes) != 3 {
+		t.Fatalf("routes = %d, want 3", len(routes))
 	}
 	for _, route := range routes {
 		for _, key := range []string{"Method", "Path"} {
@@ -58,8 +59,9 @@ func TestManagementRegistrationRouteCasing(t *testing.T) {
 		seen = append(seen, method+" "+path)
 	}
 	want := map[string]bool{
-		"GET /plugins/reset-priority/status":   true,
-		"POST /plugins/reset-priority/refresh": true,
+		"GET /plugins/reset-priority/status":      true,
+		"GET /plugins/reset-priority/status/html": true,
+		"POST /plugins/reset-priority/refresh":    true,
 	}
 	for _, s := range seen {
 		if !want[s] {
@@ -265,6 +267,188 @@ func TestResourceStatusPageIsStaticAndReadOnly(t *testing.T) {
 	}
 }
 
+func TestManagementStatusPageRendersSanitizedHTML(t *testing.T) {
+	caller := newFakeHostCaller()
+	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+	caller.addClaudeAccount("b", testBase.Add(24*time.Hour))
+	rt := newTestRuntime(t, caller)
+	registerRuntime(t, rt, "enabled: true\n")
+	snap := statusSnapshot(t, rt)
+
+	resp := managementCall(t, rt, "GET", "/v0/management/plugins/reset-priority/status/html", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status page = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Headers["Content-Type"]; len(ct) == 0 || !strings.Contains(ct[0], "text/html") {
+		t.Errorf("content type = %v", ct)
+	}
+	if cc := resp.Headers["Cache-Control"]; len(cc) == 0 || cc[0] != "no-store" {
+		t.Errorf("cache control = %v, want no-store", cc)
+	}
+	if csp := resp.Headers["Content-Security-Policy"]; len(csp) == 0 || !strings.Contains(csp[0], "frame-ancestors 'none'") {
+		t.Errorf("content security policy = %v", csp)
+	}
+
+	page := string(resp.Body)
+	for _, marker := range []string{
+		"<h2>claude</h2>",
+		"<code>a.json</code>",
+		"<code>b.json</code>",
+		"<td>200</td>", // desired priority of the earliest-reset account
+		"confirmed",
+		"Next reconcile:",
+		"Next reset deadline:",
+		`id="refresh-now"`,
+		"Refresh now",
+		"POST /v0/management/plugins/reset-priority/refresh",
+		`method: "POST"`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Errorf("management status page missing %q", marker)
+		}
+	}
+
+	// Exact reset timestamps and per-account fields come from the snapshot;
+	// the account label (an email in this fixture) must never be rendered.
+	for _, group := range snap.Providers {
+		for _, account := range group.Accounts {
+			if account.ResetAtUTC == "" || !strings.Contains(page, account.ResetAtUTC) {
+				t.Errorf("status page missing reset timestamp %q", account.ResetAtUTC)
+			}
+			if account.Label == "" {
+				t.Fatalf("test fixture lost its email label")
+			}
+			if strings.Contains(page, account.Label) {
+				t.Errorf("status page renders account label %q", account.Label)
+			}
+		}
+	}
+	if strings.Contains(page, "@example.com") {
+		t.Errorf("status page contains an email address")
+	}
+
+	// Secret safety: no access token, refresh token, or bearer material.
+	for _, secret := range []string{testAccessToken, "refresh-token-super-secret", "Bearer "} {
+		if strings.Contains(page, secret) {
+			t.Errorf("management status page leaks %q", secret)
+		}
+	}
+}
+
+func TestManagementStatusPageShowsDryRunAndStopped(t *testing.T) {
+	caller := newFakeHostCaller()
+	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+	rt := newTestRuntime(t, caller)
+	registerRuntime(t, rt, "enabled: true\ndry-run: true\n")
+
+	resp := managementCall(t, rt, "GET", "/v0/management/plugins/reset-priority/status/html", nil)
+	page := string(resp.Body)
+	for _, marker := range []string{
+		">dry-run<",
+		">enabled<",
+		">running<",
+		testBase.Add(48 * time.Hour).UTC().Format(time.RFC3339Nano), // next deadline
+	} {
+		if !strings.Contains(page, marker) {
+			t.Errorf("dry-run status page missing %q", marker)
+		}
+	}
+
+	env := decodeEnvelope(t, rt.Dispatch(hostapi.MethodPluginReconfigure,
+		lifecycleRequest(t, "enabled: false\n", 4)))
+	if !env.OK {
+		t.Fatalf("reconfigure failed: %+v", env.Error)
+	}
+	resp = managementCall(t, rt, "GET", "/v0/management/plugins/reset-priority/status/html", nil)
+	page = string(resp.Body)
+	for _, marker := range []string{">disabled<", ">stopped<"} {
+		if !strings.Contains(page, marker) {
+			t.Errorf("disabled status page missing %q", marker)
+		}
+	}
+}
+
+func TestRenderManagementStatusPageEscapesHTMLAndRedactsIdentifiers(t *testing.T) {
+	hostile := `<script>alert("x")</script>`
+	current := 100
+	snap := engine.Snapshot{
+		GeneratedAt: testBase,
+		Warnings:    []string{hostile},
+		RosterError: hostile,
+		Providers: []engine.ProviderGroup{{
+			Provider: "claude",
+			Accounts: []engine.AccountStatus{
+				{
+					Name:            hostile + ".json",
+					Label:           "leak@example.com",
+					Provider:        "claude",
+					Health:          "healthy",
+					ResetState:      "confirmed",
+					CurrentPriority: &current,
+					DesiredPriority: 200,
+					LastError:       hostile,
+					WriteError:      hostile,
+				},
+				{
+					AuthIndex:       "idx-0123456789abcdef",
+					Provider:        "claude",
+					Health:          "healthy",
+					ResetState:      "unknown",
+					DesiredPriority: 100,
+				},
+			},
+		}},
+	}
+
+	raw, err := renderManagementStatusPage(snap)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	page := string(raw)
+
+	if strings.Contains(page, "<script>alert") {
+		t.Errorf("hostile markup rendered unescaped")
+	}
+	if !strings.Contains(page, "&lt;script&gt;") {
+		t.Errorf("hostile markup missing in escaped form")
+	}
+	if strings.Contains(page, "leak@example.com") {
+		t.Errorf("account label rendered on management page")
+	}
+	if !strings.Contains(page, "auth-index idx-0123…") {
+		t.Errorf("nameless account missing redacted stable identifier")
+	}
+	if strings.Contains(page, "idx-0123456789abcdef") {
+		t.Errorf("complete auth index rendered without redaction")
+	}
+	if !strings.Contains(page, "<td>unknown</td>") {
+		t.Errorf("missing current priority placeholder for unknown physical priority")
+	}
+}
+
+func TestManagementStatusPagePathOnResourceRouteStaysStatic(t *testing.T) {
+	caller := newFakeHostCaller()
+	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+	rt := newTestRuntime(t, caller)
+	registerRuntime(t, rt, "enabled: true\n")
+
+	// A GET outside /v0/management must always fall back to the static
+	// account-free shell, even with the HTML page's path suffix.
+	resp := managementCall(t, rt, "GET", "/v0/resource/plugins/reset-priority/status/html", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("resource-path html = %d, want 200", resp.StatusCode)
+	}
+	page := string(resp.Body)
+	if !strings.Contains(page, `data-reset-priority-status="ready"`) {
+		t.Errorf("resource-path html is not the static shell")
+	}
+	for _, dynamic := range []string{"a.json", "<table", "Refresh now"} {
+		if strings.Contains(page, dynamic) {
+			t.Errorf("resource-path html contains dynamic content %q", dynamic)
+		}
+	}
+}
+
 func TestManagementUnknownRouteReturns404(t *testing.T) {
 	caller := newFakeHostCaller()
 	rt := newTestRuntime(t, caller)
@@ -279,6 +463,16 @@ func TestManagementUnknownRouteReturns404(t *testing.T) {
 	if resp.StatusCode != 404 {
 		t.Errorf("POST status = %d, want 404", resp.StatusCode)
 	}
+	// The browser HTML status view is read-only as well.
+	resp = managementCall(t, rt, "POST", "/v0/management/plugins/reset-priority/status/html", nil)
+	if resp.StatusCode != 404 {
+		t.Errorf("POST status/html = %d, want 404", resp.StatusCode)
+	}
+	// A resource-shaped path can never reach the mutating refresh action.
+	resp = managementCall(t, rt, "POST", "/v0/resource/plugins/reset-priority/refresh", nil)
+	if resp.StatusCode != 404 {
+		t.Errorf("resource POST refresh = %d, want 404", resp.StatusCode)
+	}
 }
 
 func TestManagementBeforeRegistrationReturns503(t *testing.T) {
@@ -286,6 +480,10 @@ func TestManagementBeforeRegistrationReturns503(t *testing.T) {
 	resp := managementCall(t, rt, "GET", "/v0/management/plugins/reset-priority/status", nil)
 	if resp.StatusCode != 503 {
 		t.Errorf("pre-registration status = %d, want 503", resp.StatusCode)
+	}
+	page := managementCall(t, rt, "GET", "/v0/management/plugins/reset-priority/status/html", nil)
+	if page.StatusCode != 503 {
+		t.Errorf("pre-registration status page = %d, want 503", page.StatusCode)
 	}
 
 	resource := managementCall(t, rt, "GET", "/v0/resource/plugins/reset-priority/status", nil)
