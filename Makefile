@@ -8,7 +8,9 @@
 # On Linux, `make build` produces reset-priority.so in the repository root.
 
 GO       ?= go
-GOFMT    ?= gofmt
+# Keep formatting tied to the selected Go toolchain. This matters when GO is
+# overridden with an absolute toolchain path rather than placed on PATH.
+GOFMT    ?= $(shell $(GO) env GOROOT)/bin/gofmt
 READELF  ?= readelf
 ID       := reset-priority
 DIST     ?= dist

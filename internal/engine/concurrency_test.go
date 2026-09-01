@@ -546,3 +546,94 @@ func TestAllFetchPathsShareGlobalConcurrencyLimit(t *testing.T) {
 	close(gate.release)
 	wg.Wait()
 }
+
+// TestOlderDisableCannotStopNewerEnable reproduces a disable whose Stop waits
+// behind a write while a later enabled configuration is published. The older
+// call must not quiesce the new generation after the write lane opens.
+func TestOlderDisableCannotStopNewerEnable(t *testing.T) {
+	env := newTestEnv(t, defaultConfig())
+	env.eng.writeMu.Lock()
+	var releaseOnce sync.Once
+	releaseWrite := func() { releaseOnce.Do(env.eng.writeMu.Unlock) }
+	defer releaseWrite()
+
+	disabled := defaultConfig()
+	disabled.Enabled = false
+	disabledDone := make(chan struct{})
+	go func() {
+		env.eng.Reconfigure(disabled)
+		close(disabledDone)
+	}()
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		env.eng.mu.Lock()
+		published := !env.eng.cfg.Enabled
+		env.eng.mu.Unlock()
+		if published {
+			break
+		}
+		select {
+		case <-time.After(time.Millisecond):
+		case <-deadline.C:
+			t.Fatal("disabled reconfigure did not publish before waiting for Stop")
+		}
+	}
+
+	// This call publishes a newer enabled generation without taking writeMu.
+	env.eng.Reconfigure(defaultConfig())
+	releaseWrite()
+	select {
+	case <-disabledDone:
+	case <-time.After(time.Second):
+		t.Fatal("older disabled reconfigure did not finish after write release")
+	}
+
+	env.eng.mu.Lock()
+	stopped := env.eng.stopped
+	enabled := env.eng.cfg.Enabled
+	env.eng.mu.Unlock()
+	if stopped || !enabled {
+		t.Fatalf("older disable left engine stopped=%t enabled=%t, want stopped=false enabled=true", stopped, enabled)
+	}
+}
+
+// TestProviderOptOutInvalidatesRetriesAcrossRapidReenable proves that retry
+// work scheduled before an opt-out cannot survive a disable/enable cycle and
+// perform a provider fetch in the new configuration generation.
+func TestProviderOptOutInvalidatesRetriesAcrossRapidReenable(t *testing.T) {
+	env := newTestEnv(t, defaultConfig())
+	env.addAccount("claude", "a", day(1))
+	env.reconcile()
+	before := env.claude.callCount(token("a"))
+
+	env.eng.mu.Lock()
+	acct := env.eng.accounts["idx-a"]
+	acct.resetState = ResetAwaitingNewWindow
+	acct.resetAt = baseTime
+	env.eng.startRetrySequenceLocked(acct, true)
+	env.eng.mu.Unlock()
+
+	// The queued callback is the retry's immediate attempt. Leave the two
+	// reconfiguration reconciles queued so only old retry work is exercised.
+	env.async.mu.Lock()
+	if len(env.async.funcs) != 1 {
+		env.async.mu.Unlock()
+		t.Fatalf("queued async work = %d, want one immediate retry", len(env.async.funcs))
+	}
+	oldRetry := env.async.funcs[0]
+	env.async.funcs = nil
+	env.async.mu.Unlock()
+
+	disabled := defaultConfig()
+	disabled.ManageClaude = false
+	env.eng.Reconfigure(disabled)
+	env.eng.Reconfigure(defaultConfig())
+
+	oldRetry()
+	env.clk.Advance(15 * time.Minute)
+	if got := env.claude.callCount(token("a")); got != before {
+		t.Fatalf("pre-opt-out retry work made %d provider call(s) after re-enable, want 0", got-before)
+	}
+}

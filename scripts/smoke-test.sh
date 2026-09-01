@@ -167,19 +167,21 @@ CONTAINER_CREATED=true
 
 # Copy a staged, fixed-name, executable library into the stopped container. The
 # destination is the named plugin volume, so CPA never sees a partial write.
-docker cp "${STAGED_PLUGIN}" "${CONTAINER_NAME}:/CLIProxyAPI/plugins/reset-priority.so"
-docker start "${CONTAINER_NAME}" >/dev/null
+# After docker create returns, use its immutable ID exclusively: a concurrent
+# name rebind must never redirect a smoke-test operation to another container.
+docker cp "${STAGED_PLUGIN}" "${CONTAINER_ID}:/CLIProxyAPI/plugins/reset-priority.so"
+docker start "${CONTAINER_ID}" >/dev/null
 
 HOST_PORT=""
 DEADLINE=$((SECONDS + TIMEOUT_SECONDS))
 while (( SECONDS < DEADLINE )); do
-  if [[ "$(docker container inspect --format '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null || true)" != true ]]; then
+  if [[ "$(docker container inspect --format '{{.State.Running}}' "${CONTAINER_ID}" 2>/dev/null || true)" != true ]]; then
     printf 'CPA container exited before plugin verification\n' >&2
     exit 1
   fi
 
   if [[ -z "${HOST_PORT}" ]]; then
-    PORT_MAPPING="$(docker port "${CONTAINER_NAME}" 8317/tcp 2>/dev/null | grep -m1 '^127\.0\.0\.1:' || true)"
+    PORT_MAPPING="$(docker port "${CONTAINER_ID}" 8317/tcp 2>/dev/null | grep -m1 '^127\.0\.0\.1:' || true)"
     if [[ -n "${PORT_MAPPING}" ]]; then
       HOST_PORT="${PORT_MAPPING##*:}"
     fi
@@ -192,7 +194,7 @@ while (( SECONDS < DEADLINE )); do
     if [[ "${HTTP_CODE}" == 200 ]] &&
       grep -Fq '<title>Reset Priority</title>' "${RESPONSE_FILE}" &&
       grep -Fq 'Dry-run configuration recommended' "${RESPONSE_FILE}"; then
-      docker logs "${CONTAINER_NAME}" >"${LOG_FILE}" 2>&1 || true
+      docker logs "${CONTAINER_ID}" >"${LOG_FILE}" 2>&1 || true
       printf 'plugin load verified by HTTP 200 from %s\n' \
         "http://127.0.0.1:${HOST_PORT}/v0/resource/plugins/reset-priority/status"
       exit 0

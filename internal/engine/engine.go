@@ -196,6 +196,11 @@ func (e *Engine) Stop() {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.stopLocked()
+}
+
+// stopLocked quiesces the current engine generation. Caller holds e.mu.
+func (e *Engine) stopLocked() {
 	e.stopped = true
 	if e.reconcileTimer != nil {
 		e.reconcileTimer.Stop()
@@ -217,6 +222,21 @@ func (e *Engine) Stop() {
 		acct.cancelRetriesLocked()
 	}
 	e.publishStatusLocked(e.clk.Now())
+}
+
+// stopDisabledGeneration quiesces only the disabled configuration generation
+// that requested it. A later enabled Reconfigure may publish while this call
+// waits for writeMu; that newer generation must remain runnable.
+func (e *Engine) stopDisabledGeneration(configSeq uint64) {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.configSeq != configSeq || e.cfg.Enabled {
+		return
+	}
+	e.stopLocked()
 }
 
 func (e *Engine) reserveWork() bool {
@@ -253,15 +273,30 @@ func (e *Engine) Reconfigure(cfg config.Config) {
 	e.providerCallMu.Lock()
 	e.saveMu.Lock()
 	e.mu.Lock()
+	previousCfg := e.cfg
 	e.cfg = cfg
 	e.configSeq++
+	configSeq := e.configSeq
 	e.stopped = !cfg.Enabled
+	// Invalidate retry work as soon as a provider is opted out, rather than
+	// waiting for the asynchronously scheduled reconciliation to prune retained
+	// state. A rapid opt-in must not revive callbacks scheduled before opt-out.
+	for _, acct := range e.accounts {
+		if previousCfg.Manages(acct.provider) && (!cfg.Enabled || !cfg.Manages(acct.provider)) {
+			acct.cancelRetriesLocked()
+			acct.fetchEpoch++
+			acct.reconcileFetchPending = false
+			acct.wantRetrySchedule = false
+			acct.wantAwaitingRetry = false
+			acct.awaitingNeedsImmediate = false
+		}
+	}
 	e.mu.Unlock()
 	e.saveMu.Unlock()
 	e.providerCallMu.Unlock()
 
 	if !cfg.Enabled {
-		e.Stop()
+		e.stopDisabledGeneration(configSeq)
 		return
 	}
 	e.runAsync(func() { e.Reconcile(context.Background()) })
