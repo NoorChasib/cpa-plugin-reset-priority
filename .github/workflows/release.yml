@@ -1,0 +1,345 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  PLUGIN_ID: reset-priority
+  GO_VERSION: "1.26.0"
+  GOFLAGS: "-buildvcs=false -trimpath"
+
+jobs:
+  build-linux:
+    name: Build linux/${{ matrix.goarch }} (manylinux2014)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            runner: ubuntu-24.04
+            container_platform: linux/amd64
+            container_uname: x86_64
+            go_download_arch: amd64
+            go_archive_sha256: aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235
+            manylinux_image: quay.io/pypa/manylinux2014_x86_64@sha256:7efcfd38412c356969a8a3bb681facbed1e48f52a23afd44d76f74793bbb5a95
+          - goarch: arm64
+            runner: ubuntu-24.04-arm
+            container_platform: linux/arm64
+            container_uname: aarch64
+            go_download_arch: arm64
+            go_archive_sha256: bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd
+            manylinux_image: quay.io/pypa/manylinux2014_aarch64@sha256:050223dd42a540e4e23fc4b3103a170754e71ce6b3880416ee846e1facf0d957
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v5
+
+      - name: Resolve and validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ -z "${VERSION}" || "v${VERSION}" != "${GITHUB_REF_NAME}" ]]; then
+            printf 'invalid release tag: %s\n' "${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_linux_${{ matrix.goarch }}.zip" >> "${GITHUB_ENV}"
+
+      - name: Build and package in matching manylinux2014 container
+        shell: bash
+        env:
+          CONTAINER_PLATFORM: ${{ matrix.container_platform }}
+          CONTAINER_UNAME: ${{ matrix.container_uname }}
+          GO_DOWNLOAD_ARCH: ${{ matrix.go_download_arch }}
+          GO_ARCHIVE_SHA256: ${{ matrix.go_archive_sha256 }}
+          MANYLINUX_IMAGE: ${{ matrix.manylinux_image }}
+          TARGET_GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          docker pull --platform "${CONTAINER_PLATFORM}" "${MANYLINUX_IMAGE}"
+          docker run --rm --interactive \
+            --platform "${CONTAINER_PLATFORM}" \
+            --env "CONTAINER_UNAME=${CONTAINER_UNAME}" \
+            --env "GOARCH=${TARGET_GOARCH}" \
+            --env "GO_ARCHIVE_SHA256=${GO_ARCHIVE_SHA256}" \
+            --env "GO_DOWNLOAD_ARCH=${GO_DOWNLOAD_ARCH}" \
+            --env "GO_VERSION=${GO_VERSION}" \
+            --env "GOFLAGS=${GOFLAGS}" \
+            --env "VERSION=${VERSION}" \
+            --volume "${GITHUB_WORKSPACE}:/workspace" \
+            --workdir /workspace \
+            "${MANYLINUX_IMAGE}" \
+            bash -se <<'CONTAINER'
+          if [[ "$(uname -m)" != "${CONTAINER_UNAME}" ]]; then
+            printf 'manylinux container architecture mismatch: got %s, want %s\n' \
+              "$(uname -m)" "${CONTAINER_UNAME}" >&2
+            exit 1
+          fi
+          if ! ldd --version 2>&1 | grep -Fq ' 2.17'; then
+            printf 'manylinux2014 container does not report GLIBC 2.17\n' >&2
+            ldd --version >&2 || true
+            exit 1
+          fi
+
+          go_archive="/tmp/go${GO_VERSION}.linux-${GO_DOWNLOAD_ARCH}.tar.gz"
+          curl --fail --location --retry 5 --output "${go_archive}" \
+            "https://go.dev/dl/go${GO_VERSION}.linux-${GO_DOWNLOAD_ARCH}.tar.gz"
+          printf '%s  %s\n' "${GO_ARCHIVE_SHA256}" "${go_archive}" | sha256sum --check --strict
+          rm -rf /tmp/go
+          tar -C /tmp -xzf "${go_archive}"
+          export PATH="/tmp/go/bin:${PATH}"
+          export CGO_ENABLED=1 GOOS=linux GOTOOLCHAIN=local
+          go version
+
+          make package GO=go GOOS=linux GOARCH="${GOARCH}" VERSION="${VERSION}"
+          make check-release GO=go GOOS=linux GOARCH="${GOARCH}" VERSION="${VERSION}"
+          CONTAINER
+
+      - name: Upload packaged Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            dist/${{ env.ARCHIVE_NAME }}
+            dist/${{ env.ARCHIVE_NAME }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  build-darwin:
+    name: Build darwin/${{ matrix.goarch }} (native)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            runner: macos-15-intel
+          - goarch: arm64
+            runner: macos-15
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v5
+
+      - name: Set up Go 1.26.0
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Resolve and validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ -z "${VERSION}" || "v${VERSION}" != "${GITHUB_REF_NAME}" ]]; then
+            printf 'invalid release tag: %s\n' "${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_darwin_${{ matrix.goarch }}.zip" >> "${GITHUB_ENV}"
+
+      - name: Build and package native macOS library
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(go env GOOS)/$(go env GOARCH)"
+          if [[ "${actual}" != "darwin/${{ matrix.goarch }}" ]]; then
+            printf 'native runner mismatch: got %s, want darwin/${{ matrix.goarch }}\n' "${actual}" >&2
+            exit 1
+          fi
+          make package GO=go GOOS=darwin GOARCH="${{ matrix.goarch }}" VERSION="${VERSION}"
+          make check-release GO=go GOOS=darwin GOARCH="${{ matrix.goarch }}" VERSION="${VERSION}"
+
+      - name: Upload packaged macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            dist/${{ env.ARCHIVE_NAME }}
+            dist/${{ env.ARCHIVE_NAME }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: Build windows/amd64 (native)
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v5
+
+      - name: Set up Go 1.26.0
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Set up native Windows CGO toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            make
+
+      - name: Resolve and validate release version
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ -z "${VERSION}" || "v${VERSION}" != "${GITHUB_REF_NAME}" ]]; then
+            printf 'invalid release tag: %s\n' "${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_windows_amd64.zip" >> "${GITHUB_ENV}"
+
+      - name: Build and package native Windows library
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          actual="$(go env GOOS)/$(go env GOARCH)"
+          if [[ "${actual}" != "windows/amd64" ]]; then
+            printf 'native runner mismatch: got %s, want windows/amd64\n' "${actual}" >&2
+            exit 1
+          fi
+          make package GO=go GOOS=windows GOARCH=amd64 VERSION="${VERSION}"
+          make check-release GO=go GOOS=windows GOARCH=amd64 VERSION="${VERSION}"
+
+      - name: Upload packaged Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            dist/${{ env.ARCHIVE_NAME }}
+            dist/${{ env.ARCHIVE_NAME }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - build-linux
+      - build-darwin
+      - build-windows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v5
+
+      - name: Set up Go 1.26.0
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify exact release matrix and create checksums.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          go run ./tools/packager \
+            -verify \
+            -version "${VERSION}" \
+            -out dist \
+            -require "linux_amd64,linux_arm64,darwin_amd64,darwin_arm64,windows_amd64" \
+            -combine dist/checksums.txt
+
+          expected_zips=(
+            "${PLUGIN_ID}_${VERSION}_linux_amd64.zip"
+            "${PLUGIN_ID}_${VERSION}_linux_arm64.zip"
+            "${PLUGIN_ID}_${VERSION}_darwin_amd64.zip"
+            "${PLUGIN_ID}_${VERSION}_darwin_arm64.zip"
+            "${PLUGIN_ID}_${VERSION}_windows_amd64.zip"
+          )
+          mapfile -t actual_zips < <(find dist -maxdepth 1 -type f -name '*.zip' -printf '%f\n' | sort)
+          mapfile -t sorted_expected < <(printf '%s\n' "${expected_zips[@]}" | sort)
+          if ! diff -u <(printf '%s\n' "${sorted_expected[@]}") <(printf '%s\n' "${actual_zips[@]}"); then
+            printf 'release directory does not contain exactly the five expected ZIP assets\n' >&2
+            exit 1
+          fi
+          if [[ "$(grep -c . dist/checksums.txt)" -ne 5 ]]; then
+            printf 'checksums.txt must contain exactly five non-empty lines\n' >&2
+            exit 1
+          fi
+          if grep -Ev '^[0-9a-f]{64}  [^/\\]+\.zip$' dist/checksums.txt; then
+            printf 'checksums.txt is not lowercase bare-filename sha256sum format\n' >&2
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+
+      - name: Upload the exact release asset set
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset_names=(
+            "${PLUGIN_ID}_${VERSION}_linux_amd64.zip"
+            "${PLUGIN_ID}_${VERSION}_linux_arm64.zip"
+            "${PLUGIN_ID}_${VERSION}_darwin_amd64.zip"
+            "${PLUGIN_ID}_${VERSION}_darwin_arm64.zip"
+            "${PLUGIN_ID}_${VERSION}_windows_amd64.zip"
+            "checksums.txt"
+          )
+          release_assets=()
+          for name in "${asset_names[@]}"; do
+            release_assets+=("dist/${name}")
+          done
+
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            while IFS= read -r existing; do
+              allowed=false
+              for expected in "${asset_names[@]}"; do
+                if [[ "${existing}" == "${expected}" ]]; then
+                  allowed=true
+                  break
+                fi
+              done
+              if [[ "${allowed}" != true ]]; then
+                printf 'existing release has unexpected asset %s; remove it before rerunning\n' "${existing}" >&2
+                exit 1
+              fi
+            done < <(gh release view "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')
+            gh release upload "${GITHUB_REF_NAME}" "${release_assets[@]}" \
+              --clobber \
+              --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${GITHUB_REF_NAME}" "${release_assets[@]}" \
+              --verify-tag \
+              --generate-notes \
+              --title "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}"
+          fi
+
+          mapfile -t published < <(gh release view "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' | sort)
+          mapfile -t expected < <(printf '%s\n' "${asset_names[@]}" | sort)
+          if ! diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${published[@]}"); then
+            printf 'published release asset set is not exact\n' >&2
+            exit 1
+          fi

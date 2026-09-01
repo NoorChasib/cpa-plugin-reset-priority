@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "reset-priority",
+      "name": "Reset Priority",
+      "description": "Prioritizes Claude and Codex OAuth accounts by the exact reset time of their regular weekly quota.",
+      "author": "NoorChasib",
+      "repository": "https://github.com/NoorChasib/cpa-plugin-reset-priority",
+      "homepage": "https://github.com/NoorChasib/cpa-plugin-reset-priority",
+      "license": "MIT",
+      "tags": [
+        "Scheduler",
+        "Priority",
+        "Quota",
+        "Claude",
+        "Codex"
+      ]
+    }
+  ]
+}

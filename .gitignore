@@ -1,0 +1,16 @@
+# Native build outputs (buildmode=c-shared also emits a C header)
+reset-priority.so
+reset-priority.dylib
+reset-priority.dll
+reset-priority.h
+
+# Release packaging outputs
+dist/
+
+# Go test artifacts
+*.test
+coverage.out
+coverage.html
+
+# Local agent/editor state
+.claude/worktrees/
