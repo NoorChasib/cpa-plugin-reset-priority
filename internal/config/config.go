@@ -59,16 +59,16 @@ type Config struct {
 	Warnings []string
 }
 
-// ManagedProviders returns the enabled provider IDs in a fixed order.
-func (c Config) ManagedProviders() []string {
-	out := make([]string, 0, 2)
-	if c.ManageClaude {
-		out = append(out, ProviderClaude)
+// Manages reports whether a provider group is enabled.
+func (c Config) Manages(provider string) bool {
+	switch provider {
+	case ProviderClaude:
+		return c.ManageClaude
+	case ProviderCodex:
+		return c.ManageCodex
+	default:
+		return false
 	}
-	if c.ManageCodex {
-		out = append(out, ProviderCodex)
-	}
-	return out
 }
 
 // rawConfig models the YAML subtree. Pointers distinguish absent from zero.

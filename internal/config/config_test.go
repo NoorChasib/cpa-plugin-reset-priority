@@ -1,7 +1,6 @@
 package config
 
 import (
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -85,8 +84,8 @@ dry-run: true
 	if !cfg.ManageClaude || cfg.ManageCodex {
 		t.Errorf("manage = %t/%t, want true/false", cfg.ManageClaude, cfg.ManageCodex)
 	}
-	if got := cfg.ManagedProviders(); !reflect.DeepEqual(got, []string{"claude"}) {
-		t.Errorf("ManagedProviders = %v", got)
+	if !cfg.Manages(ProviderClaude) || cfg.Manages(ProviderCodex) || cfg.Manages("other") {
+		t.Errorf("Manages does not match configured provider flags")
 	}
 }
 

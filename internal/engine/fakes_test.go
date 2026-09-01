@@ -419,7 +419,7 @@ func (env *testEnv) provider(id string) *fakeProvider {
 
 func (env *testEnv) reconcile() {
 	env.t.Helper()
-	env.eng.Reconcile(context.Background(), "test")
+	env.eng.Reconcile(context.Background())
 }
 
 // desired returns the desired priority for an account name from status.

@@ -57,13 +57,13 @@ func TestReconcileInvocationsSerialized(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		env.eng.Reconcile(context.Background(), "first")
+		env.eng.Reconcile(context.Background())
 	}()
 	<-gate.started // first reconcile is inside its provider fetch
 
 	go func() {
 		defer wg.Done()
-		env.eng.Reconcile(context.Background(), "second")
+		env.eng.Reconcile(context.Background())
 	}()
 	// Give the second reconcile a chance to (incorrectly) start: with
 	// serialization it must still be waiting before its roster listing.
@@ -106,7 +106,7 @@ func TestDeadlineDemotionNotBlockedByReconcileNetworkFetch(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		env.eng.Reconcile(context.Background(), "blocked")
+		env.eng.Reconcile(context.Background())
 	}()
 	<-gate.started
 
@@ -196,7 +196,7 @@ func TestPerformWritesSkipsStaleOrRemovedPlanEntries(t *testing.T) {
 	getsBefore := len(env.host.getCalls)
 
 	// Stale entry: planned desired no longer matches live desired.
-	stale := []writeItem{{authIndex: "idx-a", name: "a.json", provider: "claude", desired: 999, health: HealthHealthy}}
+	stale := []writeItem{{authIndex: "idx-a", provider: "claude", desired: 999, health: HealthHealthy}}
 	env.eng.performWrites(context.Background(), stale)
 	if got := env.host.saveCount(); got != savesBefore {
 		t.Errorf("stale plan entry executed: %d saves, want %d", got, savesBefore)
@@ -204,7 +204,7 @@ func TestPerformWritesSkipsStaleOrRemovedPlanEntries(t *testing.T) {
 	env.assertPhysical(map[string]int{"a": 200})
 
 	// Removed account: skipped without even reading the credential.
-	removed := []writeItem{{authIndex: "idx-gone", name: "gone.json", provider: "claude", desired: 100, health: HealthHealthy}}
+	removed := []writeItem{{authIndex: "idx-gone", provider: "claude", desired: 100, health: HealthHealthy}}
 	env.eng.performWrites(context.Background(), removed)
 	for _, idx := range env.host.getCalls[getsBefore:] {
 		if idx == "idx-gone" {
@@ -216,7 +216,7 @@ func TestPerformWritesSkipsStaleOrRemovedPlanEntries(t *testing.T) {
 	env.eng.mu.Lock()
 	env.eng.accounts["idx-a"].desired = 300
 	env.eng.mu.Unlock()
-	fresh := []writeItem{{authIndex: "idx-a", name: "a.json", provider: "claude", desired: 300, health: HealthHealthy}}
+	fresh := []writeItem{{authIndex: "idx-a", provider: "claude", desired: 300, health: HealthHealthy}}
 	env.eng.performWrites(context.Background(), fresh)
 	env.assertPhysical(map[string]int{"a": 300})
 }
@@ -254,7 +254,7 @@ func TestRequestTimeoutBoundsProviderFetchEndToEnd(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		env.eng.Reconcile(context.Background(), "hung-upstream")
+		env.eng.Reconcile(context.Background())
 		close(done)
 	}()
 	select {

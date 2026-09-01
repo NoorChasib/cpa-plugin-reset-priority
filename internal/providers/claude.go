@@ -50,17 +50,13 @@ type claudeWindow struct {
 
 // FetchWeeklyReset implements Provider.
 func (c *Claude) FetchWeeklyReset(ctx context.Context, creds Credentials) (Observation, error) {
-	resp, errDo := c.http.HTTPDo(ctx, claudeUsageRequest(creds))
-	if errDo != nil {
-		return Observation{}, fmt.Errorf("claude usage request failed: %w", errDo)
-	}
-	// Never include the response body in errors: it may carry account data.
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Observation{}, fmt.Errorf("claude usage endpoint returned HTTP %d", resp.StatusCode)
+	body, err := fetchUsageBody(ctx, c.http, claudeUsageRequest(creds), c.ID())
+	if err != nil {
+		return Observation{}, err
 	}
 	observedAt := c.now()
 	var usage claudeUsage
-	if errUnmarshal := json.Unmarshal(resp.Body, &usage); errUnmarshal != nil {
+	if errUnmarshal := json.Unmarshal(body, &usage); errUnmarshal != nil {
 		return Observation{}, fmt.Errorf("claude usage response is not valid JSON")
 	}
 	if usage.SevenDay == nil {

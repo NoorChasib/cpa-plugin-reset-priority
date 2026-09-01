@@ -44,7 +44,6 @@ type Runtime struct {
 	// runAsync lets tests run the startup reconcile synchronously.
 	runAsync func(func())
 
-	cfg    config.Config
 	engine *engine.Engine
 
 	dispatchMu   sync.Mutex
@@ -93,10 +92,8 @@ func (r *Runtime) Dispatch(method string, request []byte) (response []byte) {
 		}
 	}()
 	switch method {
-	case hostapi.MethodPluginRegister:
-		return r.handleLifecycle(request, true)
-	case hostapi.MethodPluginReconfigure:
-		return r.handleLifecycle(request, false)
+	case hostapi.MethodPluginRegister, hostapi.MethodPluginReconfigure:
+		return r.handleLifecycle(request)
 	case hostapi.MethodPluginQuiesce, hostapi.MethodPluginShutdown:
 		// The host performs terminal shutdown through the native function
 		// pointer. JSON lifecycle messages only quiesce so this Dispatch can
@@ -174,7 +171,7 @@ func (r *Runtime) Shutdown() {
 // request's config_yaml field is a []byte on the wire (base64 via standard
 // encoding/json), containing the preserved plugins.configs.reset-priority
 // YAML subtree.
-func (r *Runtime) handleLifecycle(request []byte, isRegister bool) []byte {
+func (r *Runtime) handleLifecycle(request []byte) []byte {
 	var req hostapi.LifecycleRequest
 	if len(request) > 0 {
 		if err := json.Unmarshal(request, &req); err != nil {
@@ -187,7 +184,6 @@ func (r *Runtime) handleLifecycle(request []byte, isRegister bool) []byte {
 	}
 
 	r.mu.Lock()
-	r.cfg = cfg
 	if r.engine == nil {
 		r.engine = r.buildEngineLocked(cfg)
 		if cfg.Enabled {
@@ -209,7 +205,6 @@ func (r *Runtime) handleLifecycle(request []byte, isRegister bool) []byte {
 	} else if req.SchemaVersion < schema {
 		schema = req.SchemaVersion
 	}
-	_ = isRegister
 	return okEnvelope(hostapi.Registration{
 		SchemaVersion: schema,
 		Metadata: hostapi.Metadata{
@@ -315,7 +310,7 @@ func (r *Runtime) handleManagement(request []byte) []byte {
 
 	case method == "POST" && strings.HasSuffix(path, managementRefreshPath) && !isResourcePath(path):
 		// Authenticated "Refresh now" action (spec section 15).
-		eng.Reconcile(context.Background(), "management-refresh")
+		eng.Reconcile(context.Background())
 		return okEnvelope(jsonResponse(200, map[string]any{
 			"status": "ok",
 			"detail": "reconciliation completed",

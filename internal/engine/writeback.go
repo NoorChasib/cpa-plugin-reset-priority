@@ -14,11 +14,13 @@ import (
 // writeItem is one planned priority write.
 type writeItem struct {
 	authIndex string
-	name      string
 	provider  string
 	desired   int
 	health    Health
-	disabled  bool
+
+	// Resolved from live account state immediately before execution.
+	name     string
+	disabled bool
 }
 
 // writePlanLocked selects accounts whose physical priority may need to
@@ -43,11 +45,9 @@ func (e *Engine) writePlanLocked() []writeItem {
 		}
 		plan = append(plan, writeItem{
 			authIndex: acct.authIndex,
-			name:      acct.name,
 			provider:  acct.provider,
 			desired:   acct.desired,
 			health:    acct.health,
-			disabled:  acct.disabled,
 		})
 	}
 	return plan
@@ -134,7 +134,7 @@ func (e *Engine) writeOne(ctx context.Context, item writeItem) {
 	if errGet != nil {
 		// The auth may have disappeared between discovery and save; treat
 		// as a normal concurrent roster change (spec section 14).
-		e.recordWriteError(item.authIndex, "read-before-write failed: "+shortErr(errGet))
+		e.recordWriteError(item.authIndex, "read-before-write failed: "+sanitize.Error(errGet))
 		return
 	}
 	if got.AuthIndex != "" && got.AuthIndex != item.authIndex {
@@ -181,7 +181,7 @@ func (e *Engine) writeOne(ctx context.Context, item writeItem) {
 		name = item.name
 	}
 	if errSave := e.host.AuthSave(ctx, name, raw); errSave != nil {
-		e.recordWriteError(item.authIndex, "save failed: "+shortErr(errSave))
+		e.recordWriteError(item.authIndex, "save failed: "+sanitize.Error(errSave))
 		return
 	}
 	e.updateCurrentPriority(item.authIndex, item.desired, true)
@@ -239,8 +239,4 @@ func parsePriorityRaw(raw json.RawMessage) (int, bool) {
 		}
 	}
 	return 0, false
-}
-
-func shortErr(err error) string {
-	return sanitize.Error(err)
 }

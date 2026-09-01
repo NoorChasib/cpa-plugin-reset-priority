@@ -72,12 +72,12 @@ func TestWriteAndRosterErrorLogsEmitOutsideEngineMu(t *testing.T) {
 	host.mu.Lock()
 	host.saveErr["a.json"] = errFake("save backend unavailable")
 	host.mu.Unlock()
-	eng.Reconcile(context.Background(), "test")
+	eng.Reconcile(context.Background())
 
 	host.mu.Lock()
 	host.listErr = errFake("host list unavailable")
 	host.mu.Unlock()
-	eng.Reconcile(context.Background(), "test")
+	eng.Reconcile(context.Background())
 
 	logMu.Lock()
 	defer logMu.Unlock()

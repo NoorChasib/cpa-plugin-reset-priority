@@ -35,16 +35,20 @@ func (d *captureDoer) HTTPDo(ctx context.Context, req hostapi.HTTPRequest) (host
 
 func nowFn() time.Time { return testNow }
 
+func claudeFetch(t *testing.T, body string) (Observation, error) {
+	t.Helper()
+	doer := &captureDoer{body: body}
+	return NewClaude(doer, nowFn).FetchWeeklyReset(context.Background(), Credentials{AccessToken: "tok"})
+}
+
 func TestClaudeParsesSevenDayResetExactly(t *testing.T) {
 	// Nanosecond-precision timestamp with a non-UTC offset must be
 	// preserved exactly — no truncation to days/minutes/seconds.
-	doer := &captureDoer{body: `{
+	obs, err := claudeFetch(t, `{
 		"five_hour": {"utilization": 88, "resets_at": "2026-09-01T13:00:00Z"},
 		"seven_day": {"utilization": 42.5, "resets_at": "2026-09-02T03:00:00.123456789-07:00"},
 		"seven_day_opus": {"utilization": 99, "resets_at": "2026-09-01T14:00:00Z"}
-	}`}
-	c := NewClaude(doer, nowFn)
-	obs, err := c.FetchWeeklyReset(context.Background(), Credentials{AccessToken: "tok"})
+	}`)
 	if err != nil {
 		t.Fatalf("FetchWeeklyReset: %v", err)
 	}
@@ -66,8 +70,7 @@ func TestClaudeParsesSevenDayResetExactly(t *testing.T) {
 
 func TestClaudeTimezoneOffsetsRepresentSameInstant(t *testing.T) {
 	fetch := func(ts string) time.Time {
-		doer := &captureDoer{body: `{"seven_day": {"resets_at": "` + ts + `"}}`}
-		obs, err := NewClaude(doer, nowFn).FetchWeeklyReset(context.Background(), Credentials{AccessToken: "tok"})
+		obs, err := claudeFetch(t, `{"seven_day": {"resets_at": "`+ts+`"}}`)
 		if err != nil || !obs.HasWeekly {
 			t.Fatalf("fetch %s: %v", ts, err)
 		}
@@ -109,8 +112,7 @@ func TestClaudeMissingSevenDayIsNotWeekly(t *testing.T) {
 		"unparsable":        `{"seven_day": {"resets_at": "Sep 2"}}`,
 		"empty object":      `{}`,
 	} {
-		doer := &captureDoer{body: body}
-		obs, err := NewClaude(doer, nowFn).FetchWeeklyReset(context.Background(), Credentials{AccessToken: "tok"})
+		obs, err := claudeFetch(t, body)
 		if err != nil {
 			t.Errorf("%s: unexpected error %v", name, err)
 			continue
@@ -125,12 +127,11 @@ func TestClaudeModelScopedWeeklyOnlyIsNotWeekly(t *testing.T) {
 	// Model-scoped weekly windows (seven_day_opus, seven_day_sonnet, ...) must
 	// never substitute for the regular account-wide seven_day window, even
 	// when they carry perfectly parseable future reset timestamps.
-	doer := &captureDoer{body: `{
+	obs, err := claudeFetch(t, `{
 		"five_hour": {"utilization": 12, "resets_at": "2026-09-01T13:00:00Z"},
 		"seven_day_opus": {"utilization": 55, "resets_at": "2026-09-03T00:00:00Z"},
 		"seven_day_sonnet": {"utilization": 31, "resets_at": "2026-09-04T00:00:00Z"}
-	}`}
-	obs, err := NewClaude(doer, nowFn).FetchWeeklyReset(context.Background(), Credentials{AccessToken: "tok"})
+	}`)
 	if err != nil {
 		t.Fatalf("FetchWeeklyReset: %v", err)
 	}
@@ -159,8 +160,7 @@ func TestClaudeNonStringResetsAtRejected(t *testing.T) {
 		"numeric string":        `{"seven_day": {"resets_at": "1788648000"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			doer := &captureDoer{body: body}
-			obs, err := NewClaude(doer, nowFn).FetchWeeklyReset(context.Background(), Credentials{AccessToken: "tok"})
+			obs, err := claudeFetch(t, body)
 			if err != nil {
 				t.Fatalf("FetchWeeklyReset: %v", err)
 			}
@@ -183,8 +183,7 @@ func TestClaudeHTTPErrorIsSanitized(t *testing.T) {
 }
 
 func TestClaudeInvalidJSONError(t *testing.T) {
-	doer := &captureDoer{body: `not json`}
-	if _, err := NewClaude(doer, nowFn).FetchWeeklyReset(context.Background(), Credentials{AccessToken: "tok"}); err == nil {
+	if _, err := claudeFetch(t, `not json`); err == nil {
 		t.Fatalf("want error on invalid JSON")
 	}
 }

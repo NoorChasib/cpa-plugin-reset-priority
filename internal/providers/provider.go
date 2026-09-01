@@ -31,6 +31,20 @@ type HTTPDoer interface {
 	HTTPDo(ctx context.Context, req hostapi.HTTPRequest) (hostapi.HTTPResponse, error)
 }
 
+// fetchUsageBody performs the provider-neutral HTTP framing shared by usage
+// probes. It deliberately never includes response bodies in errors because
+// they may contain private account data.
+func fetchUsageBody(ctx context.Context, http HTTPDoer, req hostapi.HTTPRequest, providerID string) ([]byte, error) {
+	resp, err := http.HTTPDo(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("%s usage request failed: %w", providerID, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s usage endpoint returned HTTP %d", providerID, resp.StatusCode)
+	}
+	return resp.Body, nil
+}
+
 // Credentials carries the minimum provider credentials extracted from the
 // physical auth JSON. Values must never be logged.
 type Credentials struct {

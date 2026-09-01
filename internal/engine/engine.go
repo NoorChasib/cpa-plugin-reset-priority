@@ -158,7 +158,7 @@ func New(cfg config.Config, deps Deps) *Engine {
 
 // Start triggers the startup reconciliation (spec section 7 trigger 1).
 func (e *Engine) Start() {
-	e.runAsync(func() { e.Reconcile(context.Background(), "startup") })
+	e.runAsync(func() { e.Reconcile(context.Background()) })
 }
 
 // Stop quiesces the engine: all timers and retries are cancelled and no new
@@ -230,7 +230,7 @@ func (e *Engine) Reconfigure(cfg config.Config) {
 		e.Stop()
 		return
 	}
-	e.runAsync(func() { e.Reconcile(context.Background(), "reconfigure") })
+	e.runAsync(func() { e.Reconcile(context.Background()) })
 }
 
 // Status returns the latest published snapshot.
@@ -244,7 +244,7 @@ func (e *Engine) Status() Snapshot {
 // bounded-concurrency weekly-reset refresh, ranking, writeback, timer
 // rescheduling, and status publication. It is synchronous, and concurrent
 // invocations (startup, hourly, management refresh) are serialized.
-func (e *Engine) Reconcile(ctx context.Context, trigger string) {
+func (e *Engine) Reconcile(ctx context.Context) {
 	if !e.reserveWork() {
 		return
 	}
@@ -318,7 +318,6 @@ func (e *Engine) Reconcile(ctx context.Context, trigger string) {
 	e.scheduleHealthPollLocked()
 	e.publishStatusLocked(e.clk.Now())
 	e.mu.Unlock()
-	_ = trigger
 }
 
 // validateRoster fails closed before an auth can enter engine state. Only
@@ -333,10 +332,7 @@ func (e *Engine) Reconcile(ctx context.Context, trigger string) {
 // has an OAuth shape is conclusive and is removed from management.
 func (e *Engine) validateRoster(ctx context.Context, entries []hostapi.AuthEntry) ([]hostapi.AuthEntry, error) {
 	e.mu.Lock()
-	managedProviders := make(map[string]bool)
-	for _, provider := range e.cfg.ManagedProviders() {
-		managedProviders[provider] = true
-	}
+	cfg := e.cfg
 	known := make(map[string]bool, len(e.accounts))
 	for authIndex := range e.accounts {
 		known[authIndex] = true
@@ -355,7 +351,7 @@ func (e *Engine) validateRoster(ctx context.Context, entries []hostapi.AuthEntry
 	pathCounts := make(map[string]int)
 	for _, entry := range entries {
 		provider := normalizeProvider(entry)
-		if !managedProviders[provider] {
+		if !cfg.Manages(provider) {
 			continue
 		}
 		name := strings.TrimSpace(entry.Name)
@@ -423,14 +419,9 @@ func (e *Engine) applyRosterLocked(entries []hostapi.AuthEntry, now time.Time) (
 	var fetchTargets []string
 	var recoveryNeedsFlush bool
 
-	managedProviders := make(map[string]bool)
-	for _, p := range e.cfg.ManagedProviders() {
-		managedProviders[p] = true
-	}
-
 	for _, entry := range entries {
 		provider := normalizeProvider(entry)
-		if !managedProviders[provider] {
+		if !e.cfg.Manages(provider) {
 			continue // unrelated providers are never touched
 		}
 		if entry.RuntimeOnly {
@@ -561,6 +552,13 @@ type fetchAttempt struct {
 	startedAt time.Time
 }
 
+// recoverySentinelPendingLocked reports whether live mode must verify the
+// physical quarantine sentinel before a recovering account can fetch or
+// promote. Caller holds e.mu.
+func (e *Engine) recoverySentinelPendingLocked(acct *account) bool {
+	return acct.health == HealthRecovering && !e.cfg.DryRun && !acct.recoverySentinelReady
+}
+
 // fetchOne reads the latest credential JSON, performs the provider quota
 // request, and applies the observation. Every request captures the account's
 // current epoch and latest-started sequence so obsolete in-flight results fail
@@ -578,8 +576,7 @@ func (e *Engine) fetchOne(ctx context.Context, authIndex string) {
 
 	e.mu.Lock()
 	acct := e.accounts[authIndex]
-	if acct == nil || e.stopped || acct.health == HealthQuarantined ||
-		(acct.health == HealthRecovering && !e.cfg.DryRun && !acct.recoverySentinelReady) {
+	if acct == nil || e.stopped || acct.health == HealthQuarantined || e.recoverySentinelPendingLocked(acct) {
 		e.mu.Unlock()
 		return
 	}
@@ -665,6 +662,20 @@ func (e *Engine) enterAwaitingNewWindowLocked(acct *account) bool {
 	return true
 }
 
+// degradeResetAfterRefreshFailureLocked preserves a still-future known reset
+// as stale and expires any known reset whose deadline has passed. Caller holds
+// e.mu.
+func (e *Engine) degradeResetAfterRefreshFailureLocked(acct *account, now time.Time) {
+	switch acct.resetState {
+	case ResetConfirmed, ResetStale:
+		if acct.resetAt.After(now) {
+			acct.resetState = ResetStale
+		} else {
+			e.enterAwaitingNewWindowLocked(acct)
+		}
+	}
+}
+
 // applyFetchFailure records a refresh failure without reshuffling ranking
 // prematurely: a still-future confirmed reset is retained (marked stale); an
 // expired reset can no longer be used and forces awaiting_new_window.
@@ -681,14 +692,7 @@ func (e *Engine) applyFetchFailure(attempt fetchAttempt, message string) {
 		e.enterAwaitingNewWindowLocked(acct)
 		return
 	}
-	switch acct.resetState {
-	case ResetConfirmed, ResetStale:
-		if acct.resetAt.After(now) {
-			acct.resetState = ResetStale
-		} else {
-			e.enterAwaitingNewWindowLocked(acct)
-		}
-	}
+	e.degradeResetAfterRefreshFailureLocked(acct, now)
 }
 
 // applyObservation folds a provider observation into account state. Taking the
@@ -725,14 +729,7 @@ func (e *Engine) applyObservation(attempt fetchAttempt, obs providers.Observatio
 		// substitute another window or signal (spec section 11).
 		acct.observedAt = obs.ObservedAt
 		acct.lastError = "provider did not report a regular weekly quota window"
-		switch acct.resetState {
-		case ResetConfirmed, ResetStale:
-			if acct.resetAt.After(now) {
-				acct.resetState = ResetStale
-			} else {
-				e.enterAwaitingNewWindowLocked(acct)
-			}
-		}
+		e.degradeResetAfterRefreshFailureLocked(acct, now)
 		return
 	}
 
@@ -741,7 +738,7 @@ func (e *Engine) applyObservation(attempt fetchAttempt, obs providers.Observatio
 		// a request begun in the current recovery epoch and a confirmed physical
 		// sentinel, except that dry-run may simulate promotion without saving.
 		if acct.health == HealthRecovering {
-			if attempt.startedAt.Before(acct.recoveredAt) || (!e.cfg.DryRun && !acct.recoverySentinelReady) {
+			if attempt.startedAt.Before(acct.recoveredAt) || e.recoverySentinelPendingLocked(acct) {
 				return
 			}
 			acct.health = HealthHealthy
@@ -1092,7 +1089,7 @@ func (e *Engine) onHealthPoll(seq uint64) {
 	}
 	if changed {
 		// The reconcile tail re-arms or disarms the poll under its own seq.
-		e.Reconcile(context.Background(), "health-poll")
+		e.Reconcile(context.Background())
 		return
 	}
 	e.mu.Lock()
@@ -1113,7 +1110,7 @@ func (e *Engine) scheduleNextReconcileLocked() {
 	interval := e.cfg.ReconcileInterval
 	e.nextReconcileAt = e.clk.Now().Add(interval)
 	e.reconcileTimer = e.afterFunc(interval, func() {
-		e.Reconcile(context.Background(), "interval")
+		e.Reconcile(context.Background())
 	})
 }
 

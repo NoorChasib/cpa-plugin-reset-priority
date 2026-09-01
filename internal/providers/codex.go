@@ -54,7 +54,7 @@ func (c *Codex) FetchWeeklyReset(ctx context.Context, creds Credentials) (Observ
 	if creds.AccountID == "" {
 		return Observation{}, fmt.Errorf("codex account id could not be resolved from credentials")
 	}
-	resp, errDo := c.http.HTTPDo(ctx, hostapi.HTTPRequest{
+	body, err := fetchUsageBody(ctx, c.http, hostapi.HTTPRequest{
 		Method: "GET",
 		URL:    codexUsageURL,
 		Headers: map[string][]string{
@@ -63,17 +63,13 @@ func (c *Codex) FetchWeeklyReset(ctx context.Context, creds Credentials) (Observ
 			"User-Agent":         {codexUserAgent},
 			"Chatgpt-Account-Id": {creds.AccountID},
 		},
-	})
-	if errDo != nil {
-		return Observation{}, fmt.Errorf("codex usage request failed: %w", errDo)
-	}
-	// Never include the response body in errors: it may carry account data.
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Observation{}, fmt.Errorf("codex usage endpoint returned HTTP %d", resp.StatusCode)
+	}, c.ID())
+	if err != nil {
+		return Observation{}, err
 	}
 	observedAt := c.now()
 	var root map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(resp.Body))
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
 	if errDecode := decoder.Decode(&root); errDecode != nil {
 		return Observation{}, fmt.Errorf("codex usage response is not valid JSON")
@@ -158,19 +154,12 @@ func isWeeklyWindow(window map[string]any) bool {
 // rounding. Codex duration declarations must be finite, integral, and exactly
 // equal to the weekly duration; truncating a fractional value is forbidden.
 func exactIntegerEquals(raw any, want int64) bool {
-	switch v := raw.(type) {
-	case json.Number:
-		text := v.String()
-		if !json.Valid([]byte(text)) {
-			return false
-		}
-		n, ok := new(big.Rat).SetString(text)
-		return ok && n.IsInt() && n.Cmp(big.NewRat(want, 1)) == 0
-	case float64:
-		return !math.IsNaN(v) && !math.IsInf(v, 0) && v == math.Trunc(v) && v == float64(want)
-	default:
+	v, ok := raw.(json.Number)
+	if !ok {
 		return false
 	}
+	n, ok := new(big.Rat).SetString(v.String())
+	return ok && n.IsInt() && n.Cmp(big.NewRat(want, 1)) == 0
 }
 
 // resetAtPlausibilitySlack absorbs modest provider/host clock disagreement
@@ -234,17 +223,12 @@ func parseUnixSecondsResetAt(num json.Number, observedAt time.Time) (time.Time, 
 // float64 -> time.Duration conversion far from overflow (604800 s is
 // ~6.05e14 ns, versus math.MaxInt64 ~9.22e18 ns).
 func parseResetAfterSeconds(raw any) (time.Duration, bool) {
-	var seconds float64
-	switch v := raw.(type) {
-	case json.Number:
-		f, err := v.Float64()
-		if err != nil {
-			return 0, false
-		}
-		seconds = f
-	case float64:
-		seconds = v
-	default:
+	v, ok := raw.(json.Number)
+	if !ok {
+		return 0, false
+	}
+	seconds, err := v.Float64()
+	if err != nil {
 		return 0, false
 	}
 	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds < 0 || seconds > weeklyWindowSeconds {

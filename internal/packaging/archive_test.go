@@ -25,6 +25,20 @@ func writeFixtures(t *testing.T, dir string, libName string) (libPath, licensePa
 	return libPath, licensePath
 }
 
+func buildReleaseMatrix(t *testing.T, out string) {
+	t.Helper()
+	for _, platform := range ReleasePlatforms {
+		ext, err := LibraryExtension(platform.GOOS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		libPath, licensePath := writeFixtures(t, t.TempDir(), "built"+ext)
+		if _, err := BuildReleaseArchive(out, plugin.PluginID, plugin.PluginVersion, platform.GOOS, platform.GOARCH, libPath, licensePath); err != nil {
+			t.Fatalf("BuildReleaseArchive(%s): %v", platform, err)
+		}
+	}
+}
+
 func TestBuildReleaseArchiveLayoutAndSidecar(t *testing.T) {
 	dir := t.TempDir()
 	libPath, licensePath := writeFixtures(t, dir, "built.so")
@@ -101,16 +115,7 @@ func TestVerifyReleaseDirAndCombinedChecksums(t *testing.T) {
 	out := filepath.Join(dir, "dist")
 
 	// Build the full five-platform release matrix from fixtures.
-	for _, platform := range ReleasePlatforms {
-		ext, err := LibraryExtension(platform.GOOS)
-		if err != nil {
-			t.Fatal(err)
-		}
-		libPath, licensePath := writeFixtures(t, t.TempDir(), "built"+ext)
-		if _, err := BuildReleaseArchive(out, plugin.PluginID, plugin.PluginVersion, platform.GOOS, platform.GOARCH, libPath, licensePath); err != nil {
-			t.Fatalf("BuildReleaseArchive(%s): %v", platform, err)
-		}
-	}
+	buildReleaseMatrix(t, out)
 
 	sums, err := VerifyReleaseDir(out, plugin.PluginID, plugin.PluginVersion, ReleasePlatforms)
 	if err != nil {
@@ -149,16 +154,7 @@ func TestVerifyReleaseDirAndCombinedChecksums(t *testing.T) {
 func buildPublishedRelease(t *testing.T) (out, checksumsPath string) {
 	t.Helper()
 	out = filepath.Join(t.TempDir(), "release")
-	for _, platform := range ReleasePlatforms {
-		ext, err := LibraryExtension(platform.GOOS)
-		if err != nil {
-			t.Fatal(err)
-		}
-		libPath, licensePath := writeFixtures(t, t.TempDir(), "built"+ext)
-		if _, err := BuildReleaseArchive(out, plugin.PluginID, plugin.PluginVersion, platform.GOOS, platform.GOARCH, libPath, licensePath); err != nil {
-			t.Fatalf("BuildReleaseArchive(%s): %v", platform, err)
-		}
-	}
+	buildReleaseMatrix(t, out)
 	sums, err := VerifyReleaseDir(out, plugin.PluginID, plugin.PluginVersion, ReleasePlatforms)
 	if err != nil {
 		t.Fatalf("VerifyReleaseDir: %v", err)

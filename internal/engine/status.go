@@ -102,7 +102,7 @@ func (e *Engine) publishStatusLocked(now time.Time) {
 	for _, provider := range []string{config.ProviderClaude, config.ProviderCodex} {
 		rows, ok := groups[provider]
 		if !ok {
-			if e.providerManaged(provider) {
+			if e.cfg.Manages(provider) {
 				snap.Providers = append(snap.Providers, ProviderGroup{Provider: provider, Accounts: []AccountStatus{}})
 			}
 			continue
@@ -116,13 +116,4 @@ func (e *Engine) publishStatusLocked(now time.Time) {
 		snap.Providers = append(snap.Providers, ProviderGroup{Provider: provider, Accounts: rows})
 	}
 	e.status = snap
-}
-
-func (e *Engine) providerManaged(provider string) bool {
-	for _, p := range e.cfg.ManagedProviders() {
-		if p == provider {
-			return true
-		}
-	}
-	return false
 }

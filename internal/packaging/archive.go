@@ -208,6 +208,17 @@ func VerifyReleaseDir(dir, id, version string, required []Platform) (map[string]
 	return verifyReleaseDir(dir, id, version, required, true)
 }
 
+func requireCanonicalChecksums(raw []byte, listed map[string]string, source string) error {
+	canonical, err := FormatChecksums(listed)
+	if err != nil {
+		return fmt.Errorf("%s: %w", source, err)
+	}
+	if string(raw) != canonical {
+		return fmt.Errorf("%s is not canonical lowercase bare-filename sha256sum format", source)
+	}
+	return nil
+}
+
 // VerifyPublishedReleaseDir validates downloaded published release assets.
 // A published release carries only the release ZIPs plus one combined
 // checksums.txt — no per-archive .sha256 sidecars — so every ZIP in dir is
@@ -227,12 +238,8 @@ func VerifyPublishedReleaseDir(dir, id, version string, required []Platform, che
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", checksumsPath, err)
 	}
-	canonical, err := FormatChecksums(listed)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", checksumsPath, err)
-	}
-	if string(raw) != canonical {
-		return nil, fmt.Errorf("%s is not canonical lowercase bare-filename sha256sum format", checksumsPath)
+	if err := requireCanonicalChecksums(raw, listed, checksumsPath); err != nil {
+		return nil, err
 	}
 	for name := range listed {
 		if _, ok := sums[name]; !ok {
@@ -306,23 +313,20 @@ func verifyReleaseDir(dir, id, version string, required []Platform, requireSidec
 			if errSidecar != nil {
 				return nil, fmt.Errorf("%s: missing .sha256 sidecar: %w", name, errSidecar)
 			}
+			source := name + ".sha256"
 			sidecar, errParse := ParseChecksums(string(sidecarRaw))
 			if errParse != nil {
-				return nil, fmt.Errorf("%s.sha256: %w", name, errParse)
+				return nil, fmt.Errorf("%s: %w", source, errParse)
 			}
 			if len(sidecar) != 1 {
-				return nil, fmt.Errorf("%s.sha256 must contain exactly one checksum entry", name)
+				return nil, fmt.Errorf("%s must contain exactly one checksum entry", source)
 			}
 			want, ok := sidecar[name]
 			if !ok {
-				return nil, fmt.Errorf("%s.sha256 has no entry for bare filename %q", name, name)
+				return nil, fmt.Errorf("%s has no entry for bare filename %q", source, name)
 			}
-			canonicalSidecar, errCanonical := FormatChecksums(map[string]string{name: want})
-			if errCanonical != nil {
-				return nil, fmt.Errorf("%s.sha256: %w", name, errCanonical)
-			}
-			if string(sidecarRaw) != canonicalSidecar {
-				return nil, fmt.Errorf("%s.sha256 is not canonical lowercase bare-filename sha256sum format", name)
+			if err := requireCanonicalChecksums(sidecarRaw, map[string]string{name: want}, source); err != nil {
+				return nil, err
 			}
 			if want != sum {
 				return nil, fmt.Errorf("%s: sha256 mismatch: archive %s, sidecar %s", name, sum, want)
