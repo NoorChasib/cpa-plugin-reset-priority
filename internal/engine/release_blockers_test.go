@@ -15,6 +15,7 @@ import (
 type sentinelCheckingProvider struct {
 	host      *fakeHost
 	authIndex string
+	token     string
 	resetAt   time.Time
 	now       func() time.Time
 
@@ -25,7 +26,7 @@ type sentinelCheckingProvider struct {
 
 func (p *sentinelCheckingProvider) ID() string { return "claude" }
 
-func (p *sentinelCheckingProvider) FetchWeeklyReset(context.Context, providers.Credentials) (providers.Observation, error) {
+func (p *sentinelCheckingProvider) FetchWeeklyReset(_ context.Context, creds providers.Credentials) (providers.Observation, error) {
 	p.host.mu.Lock()
 	var doc map[string]json.RawMessage
 	err := json.Unmarshal(p.host.docs[p.authIndex], &doc)
@@ -34,10 +35,12 @@ func (p *sentinelCheckingProvider) FetchWeeklyReset(context.Context, providers.C
 	if err != nil || !ok {
 		return providers.Observation{}, fmt.Errorf("physical sentinel unavailable at fetch start")
 	}
-	p.mu.Lock()
-	p.calls++
-	p.observed = append(p.observed, priority)
-	p.mu.Unlock()
+	if p.token == "" || creds.AccessToken == p.token {
+		p.mu.Lock()
+		p.calls++
+		p.observed = append(p.observed, priority)
+		p.mu.Unlock()
+	}
 	return providers.Observation{HasWeekly: true, ResetAt: p.resetAt, ObservedAt: p.now()}, nil
 }
 

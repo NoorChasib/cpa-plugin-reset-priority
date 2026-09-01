@@ -40,6 +40,9 @@ type fakeHost struct {
 	// beforeGet mutates state just before AuthGet returns, simulating
 	// concurrent credential refreshes.
 	beforeGet func(authIndex string)
+	// beforeSave runs after the engine authorizes a save but before the fake
+	// applies it, allowing tests to hold an already-admitted write in flight.
+	beforeSave func(name string)
 }
 
 func newFakeHost() *fakeHost {
@@ -122,6 +125,12 @@ func (h *fakeHost) runtimeCallCount() int {
 }
 
 func (h *fakeHost) AuthSave(ctx context.Context, name string, doc json.RawMessage) error {
+	h.mu.Lock()
+	hook := h.beforeSave
+	h.mu.Unlock()
+	if hook != nil {
+		hook(name)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err := h.saveErr[name]; err != nil {

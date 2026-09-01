@@ -17,6 +17,7 @@ type writeItem struct {
 	provider  string
 	desired   int
 	health    Health
+	configSeq uint64
 
 	// Resolved from live account state immediately before execution.
 	name     string
@@ -48,6 +49,7 @@ func (e *Engine) writePlanLocked() []writeItem {
 			provider:  acct.provider,
 			desired:   acct.desired,
 			health:    acct.health,
+			configSeq: e.configSeq,
 		})
 	}
 	return plan
@@ -97,7 +99,8 @@ func (e *Engine) performWrites(ctx context.Context, plan []writeItem) {
 		// Revalidate against live state under the state lock.
 		e.mu.Lock()
 		acct := e.accounts[item.authIndex]
-		if e.stopped || acct == nil || acct.desired != item.desired || acct.health != item.health {
+		if e.stopped || item.configSeq != e.configSeq || !e.cfg.Manages(item.provider) ||
+			acct == nil || acct.desired != item.desired || acct.health != item.health {
 			e.mu.Unlock()
 			continue
 		}
@@ -173,18 +176,31 @@ func (e *Engine) writeOne(ctx context.Context, item writeItem) {
 		return
 	}
 
+	// Pair the final live-state/dry-run check with AuthSave. Reconfigure updates
+	// cfg before crossing this same gate, so returning from a dry-run update
+	// means no stale read-before-write can save afterward.
+	e.saveMu.Lock()
 	if !e.writeItemCurrent(item) {
+		e.saveMu.Unlock()
 		return
 	}
 	name := got.Name
 	if name == "" {
 		name = item.name
 	}
-	if errSave := e.host.AuthSave(ctx, name, raw); errSave != nil {
+	errSave := e.host.AuthSave(ctx, name, raw)
+	if errSave == nil {
+		e.updateCurrentPriority(item.authIndex, item.desired, true)
+	}
+	e.saveMu.Unlock()
+
+	// The reconfiguration barrier covers final admission, AuthSave, and state
+	// publication only. Host logging is another native callback and must not keep
+	// an emergency dry-run/config update blocked after the write has completed.
+	if errSave != nil {
 		e.recordWriteError(item.authIndex, "save failed: "+sanitize.Error(errSave))
 		return
 	}
-	e.updateCurrentPriority(item.authIndex, item.desired, true)
 	e.logf("info", fmt.Sprintf(
 		"reset-priority: set priority of %s auth %s to %d", item.provider, name, item.desired))
 }
@@ -193,7 +209,8 @@ func (e *Engine) writeItemCurrent(item writeItem) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	acct := e.accounts[item.authIndex]
-	return !e.stopped && acct != nil && acct.desired == item.desired && acct.health == item.health
+	return !e.stopped && !e.cfg.DryRun && item.configSeq == e.configSeq && e.cfg.Manages(item.provider) &&
+		acct != nil && acct.desired == item.desired && acct.health == item.health
 }
 
 func (e *Engine) updateCurrentPriority(authIndex string, priority int, saved bool) {

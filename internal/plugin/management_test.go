@@ -148,7 +148,7 @@ func TestManagementRefreshRouteTriggersReconcile(t *testing.T) {
 	registerRuntime(t, rt, "enabled: true\n")
 
 	before := caller.httpCallCount()
-	resp := managementCall(t, rt, "POST", "/v0/management/plugins/reset-priority/refresh", nil)
+	resp := refreshCall(t, rt, nil, "")
 	if resp.StatusCode != 200 {
 		t.Fatalf("refresh = %d, want 200", resp.StatusCode)
 	}
@@ -160,15 +160,185 @@ func TestManagementRefreshRouteTriggersReconcile(t *testing.T) {
 	}
 }
 
+func TestManagementRefreshPropagatesHostCallbackID(t *testing.T) {
+	caller := newFakeHostCaller()
+	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+	rt := newTestRuntime(t, caller)
+	registerRuntime(t, rt, "enabled: true\n")
+
+	before := caller.httpCallCount()
+	resp := refreshCall(t, rt, nil, "request-context-123")
+	if resp.StatusCode != 200 {
+		t.Fatalf("refresh = %d, want 200", resp.StatusCode)
+	}
+	calls := caller.httpCallsSince(before)
+	if len(calls) == 0 {
+		t.Fatalf("refresh did not issue a provider request")
+	}
+	for _, call := range calls {
+		if call.HostCallbackID != "request-context-123" {
+			t.Errorf("provider callback id = %q, want request-context-123", call.HostCallbackID)
+		}
+	}
+}
+
+func TestManagementRefreshReportsRosterFailure(t *testing.T) {
+	caller := newFakeHostCaller()
+	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+	rt := newTestRuntime(t, caller)
+	registerRuntime(t, rt, "enabled: true\n")
+	caller.setListError(fmt.Errorf("roster unavailable"))
+
+	resp := refreshCall(t, rt, nil, "")
+	if resp.StatusCode != 503 {
+		t.Fatalf("failed refresh = %d, want 503", resp.StatusCode)
+	}
+	if !strings.Contains(string(resp.Body), `"status":"error"`) {
+		t.Fatalf("failed refresh body = %s, want error", resp.Body)
+	}
+}
+
+func TestManagementRefreshRequiresCSRFHeader(t *testing.T) {
+	caller := newFakeHostCaller()
+	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+	rt := newTestRuntime(t, caller)
+	registerRuntime(t, rt, "enabled: true\n")
+	before := caller.httpCallCount()
+
+	resp := managementRequest(t, rt, hostapi.ManagementRequest{
+		Method:  "POST",
+		Path:    "/v0/management/plugins/reset-priority/refresh",
+		Headers: map[string][]string{"Origin": {"https://attacker.example"}},
+	})
+	if resp.StatusCode != 403 {
+		t.Fatalf("cross-origin simple POST = %d, want 403", resp.StatusCode)
+	}
+	if caller.httpCallCount() != before {
+		t.Fatalf("cross-origin simple POST triggered provider traffic")
+	}
+}
+
+func TestManagementRefreshRejectsCrossSiteFetch(t *testing.T) {
+	caller := newFakeHostCaller()
+	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+	rt := newTestRuntime(t, caller)
+	registerRuntime(t, rt, "enabled: true\n")
+	before := caller.httpCallCount()
+
+	resp := refreshCall(t, rt, map[string][]string{
+		"Sec-Fetch-Site": {"cross-site"},
+	}, "")
+	if resp.StatusCode != 403 {
+		t.Fatalf("cross-site refresh = %d, want 403", resp.StatusCode)
+	}
+	if caller.httpCallCount() != before {
+		t.Fatalf("cross-site refresh triggered provider traffic")
+	}
+}
+
+func TestManagementRefreshRejectsSameSiteSiblingOrigin(t *testing.T) {
+	caller := newFakeHostCaller()
+	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+	rt := newTestRuntime(t, caller)
+	registerRuntime(t, rt, "enabled: true\n")
+	before := caller.httpCallCount()
+
+	resp := refreshCall(t, rt, map[string][]string{
+		"Origin":         {"https://sibling.example.test"},
+		"Sec-Fetch-Site": {"same-site"},
+	}, "")
+	if resp.StatusCode != 403 {
+		t.Fatalf("same-site sibling refresh = %d, want 403", resp.StatusCode)
+	}
+	if caller.httpCallCount() != before {
+		t.Fatalf("same-site sibling refresh triggered provider traffic")
+	}
+}
+
+func TestManagementRefreshRejectsBrowserOriginWithoutFetchMetadata(t *testing.T) {
+	caller := newFakeHostCaller()
+	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+	rt := newTestRuntime(t, caller)
+	registerRuntime(t, rt, "enabled: true\n")
+	before := caller.httpCallCount()
+
+	resp := refreshCall(t, rt, map[string][]string{
+		"Origin": {"https://unknown-origin.example"},
+	}, "")
+	if resp.StatusCode != 403 {
+		t.Fatalf("origin without fetch metadata = %d, want 403", resp.StatusCode)
+	}
+	if caller.httpCallCount() != before {
+		t.Fatalf("origin without fetch metadata triggered provider traffic")
+	}
+}
+
+func TestManagementRefreshRejectsInvalidFetchMetadata(t *testing.T) {
+	for _, value := range []string{"", "unknown", "same-origin, cross-site"} {
+		t.Run(value, func(t *testing.T) {
+			caller := newFakeHostCaller()
+			caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+			rt := newTestRuntime(t, caller)
+			registerRuntime(t, rt, "enabled: true\n")
+			before := caller.httpCallCount()
+
+			resp := refreshCall(t, rt, map[string][]string{
+				"Sec-Fetch-Site": {value},
+			}, "")
+			if resp.StatusCode != 403 {
+				t.Fatalf("fetch metadata %q = %d, want 403", value, resp.StatusCode)
+			}
+			if caller.httpCallCount() != before {
+				t.Fatalf("invalid fetch metadata %q triggered provider traffic", value)
+			}
+		})
+	}
+}
+
+func TestManagementRefreshAllowsSameOriginBrowserAndHeaderClient(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		headers map[string][]string
+	}{
+		{name: "same-origin browser", headers: map[string][]string{
+			"Origin":         {"https://management.example.test"},
+			"Sec-Fetch-Site": {"same-origin"},
+		}},
+		{name: "browser navigation origin", headers: map[string][]string{
+			"Sec-Fetch-Site": {"none"},
+		}},
+		{name: "non-browser management client"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			caller := newFakeHostCaller()
+			caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+			rt := newTestRuntime(t, caller)
+			registerRuntime(t, rt, "enabled: true\n")
+			before := caller.httpCallCount()
+
+			resp := refreshCall(t, rt, tc.headers, "")
+			if resp.StatusCode != 200 {
+				t.Fatalf("refresh = %d, want 200", resp.StatusCode)
+			}
+			if caller.httpCallCount() <= before {
+				t.Fatalf("allowed refresh did not trigger provider traffic")
+			}
+		})
+	}
+}
+
 func TestManagementRefreshCannotActivateDisabledRegistration(t *testing.T) {
 	caller := newFakeHostCaller()
 	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
 	rt := newTestRuntime(t, caller)
 	registerRuntime(t, rt, "enabled: false\n")
 
-	resp := managementCall(t, rt, "POST", "/v0/management/plugins/reset-priority/refresh", nil)
-	if resp.StatusCode != 200 {
-		t.Fatalf("disabled refresh = %d, want an inert 200 response", resp.StatusCode)
+	resp := refreshCall(t, rt, nil, "")
+	if resp.StatusCode != 409 {
+		t.Fatalf("disabled refresh = %d, want 409", resp.StatusCode)
+	}
+	if !strings.Contains(string(resp.Body), `"status":"no_op"`) {
+		t.Fatalf("disabled refresh body = %s, want no_op", resp.Body)
 	}
 	if got := caller.httpCallCount(); got != 0 {
 		t.Fatalf("disabled refresh performed %d provider fetches, want 0", got)
@@ -302,6 +472,7 @@ func TestManagementStatusPageRendersSanitizedHTML(t *testing.T) {
 		"Refresh now",
 		"POST /v0/management/plugins/reset-priority/refresh",
 		`method: "POST"`,
+		`"X-Reset-Priority-Refresh": "1"`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Errorf("management status page missing %q", marker)

@@ -23,6 +23,20 @@ import (
 // maxConcurrentFetches bounds concurrent provider quota requests.
 const maxConcurrentFetches = 4
 
+// ReconcileResult describes the outcome of one reconciliation pass.
+type ReconcileResult string
+
+const (
+	// ReconcileResultSuccess reports that a full reconciliation pass completed.
+	ReconcileResultSuccess ReconcileResult = "success"
+	// ReconcileResultNoOp reports that the engine was stopped before the pass
+	// could complete.
+	ReconcileResultNoOp ReconcileResult = "no_op"
+	// ReconcileResultError reports that roster discovery or validation failed,
+	// so the engine retained its prior roster rather than applying a partial one.
+	ReconcileResultError ReconcileResult = "error"
+)
+
 // resetRetryDelays is the bounded reset-specific / recovery retry schedule
 // (offsets from the triggering event). After the last attempt the normal
 // reconciliation interval takes over (spec sections 6A.5 and 10).
@@ -93,8 +107,19 @@ type Engine struct {
 	// interleave read-mutate-save cycles for the same account. It only
 	// guards local host get/save callbacks, never provider network work.
 	writeMu sync.Mutex
+	// saveMu makes a reconfiguration barrier mutually exclusive with the final
+	// dry-run check and host.auth.save. This lets Reconfigure return while a
+	// read-before-write is blocked, while still ensuring a dry-run update cannot
+	// be followed by a stale save.
+	saveMu sync.Mutex
+	// providerCallMu is a shared admission barrier around actual provider calls.
+	// Reconfigure takes it exclusively while publishing provider opt-outs, so it
+	// waits for already-admitted calls and no stale call can begin afterward.
+	// The read side preserves the normal four-way provider concurrency.
+	providerCallMu sync.RWMutex
 
 	cfg       config.Config
+	configSeq uint64
 	clk       clock.Clock
 	host      HostAuth
 	providers map[string]providers.Provider
@@ -220,12 +245,21 @@ func (e *Engine) Shutdown() {
 // Reconfigure swaps configuration (plugin.reconfigure) and triggers a fresh
 // reconciliation when enabled.
 func (e *Engine) Reconfigure(cfg config.Config) {
+	// Publish permission changes while holding the same gates as the final
+	// AuthSave and provider-call admissions. Already-authorized work completes
+	// before the config changes; work still blocked in a local credential read
+	// reaches final admission afterward and observes the new generation. Thus no
+	// stale save or newly-started opted-out provider call can follow this return.
+	e.providerCallMu.Lock()
+	e.saveMu.Lock()
 	e.mu.Lock()
 	e.cfg = cfg
-	if cfg.Enabled {
-		e.stopped = false
-	}
+	e.configSeq++
+	e.stopped = !cfg.Enabled
 	e.mu.Unlock()
+	e.saveMu.Unlock()
+	e.providerCallMu.Unlock()
+
 	if !cfg.Enabled {
 		e.Stop()
 		return
@@ -243,8 +277,11 @@ func (e *Engine) Status() Snapshot {
 // Reconcile performs one full reconciliation pass: roster discovery,
 // bounded-concurrency weekly-reset refresh, ranking, writeback, timer
 // rescheduling, and status publication. It is synchronous, and concurrent
-// invocations (startup, hourly, management refresh) are serialized.
-func (e *Engine) Reconcile(ctx context.Context) {
+// invocations (startup, hourly, management refresh) are serialized. It returns
+// no_op when stopped, error when roster discovery or validation is deferred,
+// and success after a complete pass.
+func (e *Engine) Reconcile(ctx context.Context) (result ReconcileResult) {
+	result = ReconcileResultNoOp
 	if !e.reserveWork() {
 		return
 	}
@@ -259,6 +296,38 @@ func (e *Engine) Reconcile(ctx context.Context) {
 		return
 	}
 	e.mu.Unlock()
+	result = ReconcileResultSuccess
+
+	// Claim the current roster's immediate provider attempts before any blocking
+	// local write, list, or validation callback. Otherwise an exact deadline
+	// reached while this pass waits can launch a detached retry, followed by a
+	// duplicate full-pass request that alone carries the management callback ID.
+	e.mu.Lock()
+	if e.stopped {
+		e.mu.Unlock()
+		return ReconcileResultNoOp
+	}
+	reservedTargets := e.reconcileFetchTargetsLocked()
+	e.reserveReconcileFetchesLocked(reservedTargets)
+	e.mu.Unlock()
+	reservationsHeld := true
+	defer func() {
+		if reservationsHeld {
+			e.releaseReconcileFetches(reservedTargets)
+		}
+	}()
+
+	// A reconfiguration can disable one provider while retaining engine state
+	// from the prior pass. Remove those accounts before the pre-fetch flush so
+	// opted-out credentials can never receive one final rank/deadline write.
+	e.pruneUnmanagedAccounts()
+
+	// A missed exact-deadline callback must not let a stale known window reach a
+	// provider fetch. Demote and persist every already-expired known deadline
+	// before roster discovery can produce the next fetch targets. Do not launch
+	// the deadline retry here: this full pass is about to fetch the same account,
+	// and the post-fetch flush will arm retries only if it still needs a new window.
+	e.flushBeforeReconcile(ctx)
 
 	entries, errRoster := e.host.AuthList(ctx)
 	var validated []hostapi.AuthEntry
@@ -267,13 +336,14 @@ func (e *Engine) Reconcile(ctx context.Context) {
 	}
 
 	var fetchTargets []string
-	var recoveryNeedsFlush bool
+	var preFetchFlushNeeded bool
 	if errRoster != nil {
+		result = ReconcileResultError
 		rosterError := sanitize.Error(errRoster)
 		e.mu.Lock()
 		if e.stopped {
 			e.mu.Unlock()
-			return
+			return ReconcileResultNoOp
 		}
 		// A list or validation read was incomplete. Keep the prior roster as one
 		// transaction rather than contracting the rank pool because one established
@@ -282,6 +352,14 @@ func (e *Engine) Reconcile(ctx context.Context) {
 		e.mu.Unlock()
 		// Cross-ABI host logging must never run under Engine.mu (see Logger).
 		e.logf("warn", "reset-priority: auth roster reconciliation deferred: "+rosterError)
+
+		// No full-pass provider fetch can be trusted without a validated roster.
+		// Release its provisional ownership before consuming any missed-deadline
+		// intent in ordinary mode: demotion is already physical before the required
+		// immediate retry is launched, followed by the documented delayed ladder.
+		e.releaseReconcileFetches(reservedTargets)
+		reservationsHeld = false
+		e.flush(ctx)
 	} else {
 		// Serialize roster health transitions with writeback so quarantine and
 		// recovery cannot race a stale rank write. A newly quarantined auth may
@@ -291,33 +369,132 @@ func (e *Engine) Reconcile(ctx context.Context) {
 		if e.stopped {
 			e.mu.Unlock()
 			e.writeMu.Unlock()
-			return
+			return ReconcileResultNoOp
 		}
 		e.lastRosterError = ""
+		var recoveryNeedsFlush bool
 		fetchTargets, recoveryNeedsFlush = e.applyRosterLocked(validated, e.clk.Now())
+		e.replaceReconcileFetchReservationsLocked(fetchTargets)
+		reservedTargets = fetchTargets
+		// Roster validation can block across the exact reset instant. Detect that
+		// transition under the same state lock; the conditional flush below avoids
+		// writing provisional rankings for newly discovered unknown accounts.
+		preFetchFlushNeeded = recoveryNeedsFlush || e.demoteExpiredLocked(e.clk.Now())
 		e.mu.Unlock()
 		e.writeMu.Unlock()
-	}
 
-	if recoveryNeedsFlush {
-		// A quarantined -> recovering transition must synchronously verify or
-		// write the sentinel before any recovery quota request can begin.
-		e.flush(ctx)
+		if preFetchFlushNeeded {
+			// Persist every deadline demotion and verify/write every recovery sentinel
+			// before provider traffic. The full pass owns the immediate fetch, so this
+			// flush deliberately leaves awaiting retry intent pending.
+			e.flushBeforeReconcile(ctx)
+		}
+		e.fetchAll(ctx, fetchTargets)
+		e.releaseReconcileFetches(fetchTargets)
+		reservationsHeld = false
+		e.flushAfterFetch(ctx)
 	}
-	e.fetchAll(ctx, fetchTargets)
-
-	e.flush(ctx)
 
 	e.mu.Lock()
 	if e.stopped {
 		e.mu.Unlock()
-		return
+		return ReconcileResultNoOp
 	}
 	e.scheduleRecoveryRetriesLocked()
 	e.scheduleNextReconcileLocked()
 	e.scheduleHealthPollLocked()
 	e.publishStatusLocked(e.clk.Now())
 	e.mu.Unlock()
+	return result
+}
+
+// pruneUnmanagedAccounts removes retained state for providers disabled by the
+// current configuration before any ranking or write planning. writeMu keeps the
+// transition ordered after an older write pass; configSeq makes that older pass
+// fail its final save admission if it was still blocked in AuthGet when the
+// reconfiguration was published.
+func (e *Engine) pruneUnmanagedAccounts() {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for authIndex, acct := range e.accounts {
+		if e.cfg.Manages(acct.provider) {
+			continue
+		}
+		acct.cancelRetriesLocked()
+		acct.fetchEpoch++
+		delete(e.accounts, authIndex)
+	}
+}
+
+// reconcileFetchTargetsLocked snapshots the retained accounts for which a full
+// pass can own provider work before roster callbacks refine that set. Caller
+// holds e.mu.
+func (e *Engine) reconcileFetchTargetsLocked() []string {
+	var authIndexes []string
+	for authIndex, acct := range e.accounts {
+		if e.cfg.Manages(acct.provider) && acct.health != HealthQuarantined {
+			authIndexes = append(authIndexes, authIndex)
+		}
+	}
+	return authIndexes
+}
+
+// reserveReconcileFetchesLocked gives this full pass ownership of each target's
+// immediate provider attempt. Existing bounded retries are invalidated; an exact
+// deadline may still demote/write synchronously, but collectAwaitingRetriesLocked
+// leaves its retry intent pending for this pass. Caller holds e.mu.
+func (e *Engine) reserveReconcileFetchesLocked(authIndexes []string) {
+	for _, authIndex := range authIndexes {
+		acct := e.accounts[authIndex]
+		if acct == nil || !e.cfg.Manages(acct.provider) || acct.health == HealthQuarantined ||
+			acct.reconcileFetchPending {
+			continue
+		}
+		// The full pass replaces any live ladder with its own immediate attempt.
+		// Preserve enough intent to rebuild the delayed ladder if that attempt
+		// fails or cannot begin (for example, a recovery sentinel is still pending).
+		if acct.resetState == ResetAwaitingNewWindow {
+			acct.wantAwaitingRetry = true
+			// The full pass replaces the prior immediate/delayed schedule. It clears
+			// this bit only at actual provider admission; any earlier exit must restore
+			// a true post-demotion immediate attempt rather than waiting five seconds.
+			acct.awaitingNeedsImmediate = true
+		}
+		if acct.health == HealthRecovering {
+			acct.wantRetrySchedule = true
+		}
+		acct.cancelRetriesLocked()
+		acct.reconcileFetchPending = true
+	}
+}
+
+// replaceReconcileFetchReservationsLocked updates the provisional pre-roster
+// reservation to the validated fetch roster without re-invalidating accounts
+// already owned by this pass. Caller holds e.mu.
+func (e *Engine) replaceReconcileFetchReservationsLocked(authIndexes []string) {
+	wanted := make(map[string]struct{}, len(authIndexes))
+	for _, authIndex := range authIndexes {
+		wanted[authIndex] = struct{}{}
+	}
+	for authIndex, acct := range e.accounts {
+		if _, ok := wanted[authIndex]; !ok {
+			acct.reconcileFetchPending = false
+		}
+	}
+	e.reserveReconcileFetchesLocked(authIndexes)
+}
+
+func (e *Engine) releaseReconcileFetches(authIndexes []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, authIndex := range authIndexes {
+		if acct := e.accounts[authIndex]; acct != nil {
+			acct.reconcileFetchPending = false
+		}
+	}
 }
 
 // validateRoster fails closed before an auth can enter engine state. Only
@@ -471,6 +648,7 @@ func (e *Engine) applyRosterLocked(entries []hostapi.AuthEntry, now time.Time) (
 			acct.recoverySentinelReady = false
 			acct.wantRetrySchedule = false
 			acct.wantAwaitingRetry = false
+			acct.awaitingNeedsImmediate = false
 		case acct.health == HealthQuarantined && acct.hasPostSentinelRecoveryEvidence(entry):
 			// CPA reports the credential healthy again with evidence newer than any
 			// plugin-written sentinel. Discard all pre-failure reset/fetch state and
@@ -487,6 +665,7 @@ func (e *Engine) applyRosterLocked(entries []hostapi.AuthEntry, now time.Time) (
 			acct.currentKnown = false
 			acct.wantRetrySchedule = true
 			acct.wantAwaitingRetry = false
+			acct.awaitingNeedsImmediate = false
 			recoveryNeedsFlush = true
 		}
 		if acct.health == HealthRecovering && (!acct.currentKnown || acct.currentPriority != e.cfg.QuarantinePriority) {
@@ -539,17 +718,21 @@ func (e *Engine) fetchAll(ctx context.Context, authIndexes []string) {
 		wg.Add(1)
 		go func(idx string) {
 			defer wg.Done()
-			e.fetchOne(ctx, idx)
+			e.fetchOneInternal(ctx, idx, true, noRetrySequence)
 		}(authIndex)
 	}
 	wg.Wait()
 }
 
+const noRetrySequence = -1
+
 type fetchAttempt struct {
-	authIndex string
-	epoch     uint64
-	seq       uint64
-	startedAt time.Time
+	authIndex        string
+	epoch            uint64
+	seq              uint64
+	configSeq        uint64
+	expectedRetrySeq int
+	startedAt        time.Time
 }
 
 // recoverySentinelPendingLocked reports whether live mode must verify the
@@ -559,11 +742,28 @@ func (e *Engine) recoverySentinelPendingLocked(acct *account) bool {
 	return acct.health == HealthRecovering && !e.cfg.DryRun && !acct.recoverySentinelReady
 }
 
-// fetchOne reads the latest credential JSON, performs the provider quota
-// request, and applies the observation. Every request captures the account's
-// current epoch and latest-started sequence so obsolete in-flight results fail
-// closed even when provider timestamps are equal.
+// fetchOne is the direct/retry fetch path. Full reconciliations use
+// fetchOneInternal with reconcileOwned=true so a delayed deadline callback can
+// hand its immediate attempt to the already-running pass without duplication.
 func (e *Engine) fetchOne(ctx context.Context, authIndex string) {
+	e.fetchOneInternal(ctx, authIndex, false, noRetrySequence)
+}
+
+// fetchOneInternal reads the latest credential JSON, performs the provider
+// quota request, and applies the observation. Every request captures the
+// account epoch, config generation, and latest-started sequence so obsolete
+// in-flight work fails closed even when provider timestamps are equal.
+//
+// Expiry is checked both before the credential read and at final provider-call
+// admission. If a reset crosses during a local host callback, the old attempt
+// is invalidated, demotion is synchronously persisted, and only then does a
+// reconcile-owned replacement attempt proceed.
+func (e *Engine) fetchOneInternal(
+	ctx context.Context,
+	authIndex string,
+	reconcileOwned bool,
+	expectedRetrySeq int,
+) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -574,54 +774,115 @@ func (e *Engine) fetchOne(ctx context.Context, authIndex string) {
 		return
 	}
 
-	e.mu.Lock()
-	acct := e.accounts[authIndex]
-	if acct == nil || e.stopped || acct.health == HealthQuarantined || e.recoverySentinelPendingLocked(acct) {
+	for {
+		e.mu.Lock()
+		acct := e.accounts[authIndex]
+		if acct == nil || e.stopped || !e.cfg.Manages(acct.provider) ||
+			acct.health == HealthQuarantined || e.recoverySentinelPendingLocked(acct) ||
+			(expectedRetrySeq != noRetrySequence && acct.retrySeq != expectedRetrySeq) {
+			e.mu.Unlock()
+			return
+		}
+		now := e.clk.Now()
+		if acct.health == HealthHealthy &&
+			(acct.resetState == ResetConfirmed || acct.resetState == ResetStale) &&
+			!acct.resetAt.After(now) {
+			e.enterAwaitingNewWindowLocked(acct)
+			e.mu.Unlock()
+			e.flushBeforeReconcile(ctx)
+			continue
+		}
+		acct.nextFetchSeq++
+		acct.latestStartedFetchSeq = acct.nextFetchSeq
+		attempt := fetchAttempt{
+			authIndex:        authIndex,
+			epoch:            acct.fetchEpoch,
+			seq:              acct.latestStartedFetchSeq,
+			configSeq:        e.configSeq,
+			expectedRetrySeq: expectedRetrySeq,
+			startedAt:        now,
+		}
+		providerID := acct.provider
+		timeout := e.cfg.RequestTimeout
 		e.mu.Unlock()
-		return
-	}
-	acct.nextFetchSeq++
-	acct.latestStartedFetchSeq = acct.nextFetchSeq
-	attempt := fetchAttempt{
-		authIndex: authIndex,
-		epoch:     acct.fetchEpoch,
-		seq:       acct.latestStartedFetchSeq,
-		startedAt: e.clk.Now(),
-	}
-	providerID := acct.provider
-	timeout := e.cfg.RequestTimeout
-	e.mu.Unlock()
 
-	provider := e.providers[providerID]
-	if provider == nil {
-		e.applyFetchFailure(attempt, "no provider adapter for "+providerID)
-		return
-	}
+		provider := e.providers[providerID]
+		if provider == nil {
+			e.applyFetchFailure(attempt, "no provider adapter for "+providerID)
+			return
+		}
 
-	fetchCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 
-	// Read the latest credential JSON just before use; never cache tokens.
-	got, errGet := e.host.AuthGet(fetchCtx, authIndex)
-	if errGet != nil {
-		e.applyFetchFailure(attempt, sanitize.Error(errGet))
+		// Read the latest credential JSON just before use; never cache tokens.
+		got, errGet := e.host.AuthGet(fetchCtx, authIndex)
+		if errGet != nil {
+			cancel()
+			e.applyFetchFailure(attempt, sanitize.Error(errGet))
+			return
+		}
+		creds, errCreds := providers.ExtractCredentials(providerID, got.JSON)
+		if errCreds != nil {
+			cancel()
+			e.applyFetchFailure(attempt, sanitize.Error(errCreds))
+			return
+		}
+
+		// Pair final provider admission with configuration publication. The shared
+		// side allows normal concurrent fetches; Reconfigure's exclusive side waits
+		// for admitted calls and prevents stale provider traffic after opt-out.
+		e.providerCallMu.RLock()
+		e.mu.Lock()
+		acct = e.accounts[authIndex]
+		if !e.fetchAttemptCurrentLocked(acct, attempt) {
+			restart := reconcileOwned && acct != nil && !e.stopped &&
+				e.cfg.Manages(acct.provider) && acct.reconcileFetchPending &&
+				acct.health != HealthQuarantined && acct.resetState == ResetAwaitingNewWindow
+			e.mu.Unlock()
+			e.providerCallMu.RUnlock()
+			cancel()
+			if restart {
+				e.flushBeforeReconcile(ctx)
+				continue
+			}
+			return
+		}
+		now = e.clk.Now()
+		if acct.health == HealthHealthy &&
+			(acct.resetState == ResetConfirmed || acct.resetState == ResetStale) &&
+			!acct.resetAt.After(now) {
+			e.enterAwaitingNewWindowLocked(acct)
+			e.mu.Unlock()
+			e.providerCallMu.RUnlock()
+			cancel()
+			e.flushBeforeReconcile(ctx)
+			continue
+		}
+		if acct.resetState == ResetAwaitingNewWindow {
+			// Admission to the provider call is the point at which a request can
+			// satisfy the required post-demotion immediate attempt. Credential-read
+			// failures and requests invalidated before this gate do not count.
+			acct.awaitingNeedsImmediate = false
+		}
+		e.mu.Unlock()
+
+		obs, errFetch := provider.FetchWeeklyReset(fetchCtx, creds)
+		e.providerCallMu.RUnlock()
+		cancel()
+		if errFetch != nil {
+			e.applyFetchFailure(attempt, sanitize.Error(errFetch))
+			return
+		}
+		e.applyObservation(attempt, obs)
 		return
 	}
-	creds, errCreds := providers.ExtractCredentials(providerID, got.JSON)
-	if errCreds != nil {
-		e.applyFetchFailure(attempt, sanitize.Error(errCreds))
-		return
-	}
-	obs, errFetch := provider.FetchWeeklyReset(fetchCtx, creds)
-	if errFetch != nil {
-		e.applyFetchFailure(attempt, sanitize.Error(errFetch))
-		return
-	}
-	e.applyObservation(attempt, obs)
 }
 
 func (e *Engine) fetchAttemptCurrentLocked(acct *account, attempt fetchAttempt) bool {
-	return acct != nil && !e.stopped && acct.health != HealthQuarantined && acct.fetchEpoch == attempt.epoch
+	return acct != nil && !e.stopped && e.cfg.Manages(acct.provider) &&
+		attempt.configSeq == e.configSeq && acct.health != HealthQuarantined &&
+		acct.fetchEpoch == attempt.epoch &&
+		(attempt.expectedRetrySeq == noRetrySequence || acct.retrySeq == attempt.expectedRetrySeq)
 }
 
 // A failure is authoritative only for the latest-started attempt. An older
@@ -658,6 +919,11 @@ func (e *Engine) enterAwaitingNewWindowLocked(acct *account) bool {
 	acct.resetState = ResetAwaitingNewWindow
 	acct.fetchEpoch++
 	acct.wantAwaitingRetry = true
+	// If a full-pass request was already reserved, it may have begun before this
+	// demotion. Provider admission clears the flag only for a request that reaches
+	// the provider after entering awaiting_new_window; otherwise the post-fetch
+	// flush restores the required immediate attempt.
+	acct.awaitingNeedsImmediate = acct.reconcileFetchPending
 	acct.wantRetrySchedule = false
 	return true
 }
@@ -690,6 +956,7 @@ func (e *Engine) applyFetchFailure(attempt fetchAttempt, message string) {
 	acct.lastError = message
 	if e.fetchCrossedKnownDeadlineLocked(acct, attempt, now) {
 		e.enterAwaitingNewWindowLocked(acct)
+		acct.awaitingNeedsImmediate = true
 		return
 	}
 	e.degradeResetAfterRefreshFailureLocked(acct, now)
@@ -721,6 +988,7 @@ func (e *Engine) applyObservation(attempt fetchAttempt, obs providers.Observatio
 	if e.fetchCrossedKnownDeadlineLocked(acct, attempt, now) {
 		acct.lastError = "discarded provider result from request begun before the expired weekly reset"
 		e.enterAwaitingNewWindowLocked(acct)
+		acct.awaitingNeedsImmediate = true
 		return
 	}
 
@@ -751,6 +1019,7 @@ func (e *Engine) applyObservation(attempt fetchAttempt, obs providers.Observatio
 		acct.lastError = ""
 		acct.wantRetrySchedule = false
 		acct.wantAwaitingRetry = false
+		acct.awaitingNeedsImmediate = false
 		acct.cancelRetriesLocked()
 		return
 	}
@@ -768,13 +1037,44 @@ func (e *Engine) applyObservation(attempt fetchAttempt, obs providers.Observatio
 type retrySchedule struct {
 	authIndex string
 	epoch     uint64
+	retrySeq  int
+	immediate bool
 }
 
 // flush recomputes ranking and synchronously persists local demotions before
 // any reset-specific network fetch is armed. If another exact deadline passes
 // while host writeback is in progress, the loop demotes and writes that account
 // too; rescheduling must never silently discard a deadline crossed mid-write.
+type awaitingRetryMode uint8
+
+const (
+	awaitingRetryNone awaitingRetryMode = iota
+	awaitingRetryImmediate
+	awaitingRetryDelayed
+)
+
 func (e *Engine) flush(ctx context.Context) {
+	e.flushInternal(ctx, awaitingRetryImmediate)
+}
+
+// flushBeforeReconcile performs the same local demotion and writeback but leaves
+// awaiting-window retry intent pending. The enclosing full reconciliation is
+// about to fetch every managed healthy account itself; launching an immediate
+// retry here would duplicate that provider request and lose its management
+// callback context. The ordinary post-fetch flush either clears the intent after
+// a fresh observation or arms retries if the account still awaits a new window.
+func (e *Engine) flushBeforeReconcile(ctx context.Context) {
+	e.flushInternal(ctx, awaitingRetryNone)
+}
+
+// flushAfterFetch treats the just-completed provider request as the immediate
+// rollover attempt. If the account still awaits a new window, only the
+// documented +5s/+30s/+2m/+5m/+15m delayed attempts are armed.
+func (e *Engine) flushAfterFetch(ctx context.Context) {
+	e.flushInternal(ctx, awaitingRetryDelayed)
+}
+
+func (e *Engine) flushInternal(ctx context.Context, retryMode awaitingRetryMode) {
 	var pendingRetries []retrySchedule
 	for {
 		e.mu.Lock()
@@ -786,7 +1086,9 @@ func (e *Engine) flush(ctx context.Context) {
 		e.demoteExpiredLocked(now)
 		e.recomputeDesiredLocked(now)
 		plan := e.writePlanLocked()
-		pendingRetries = append(pendingRetries, e.collectAwaitingRetriesLocked()...)
+		if retryMode != awaitingRetryNone {
+			pendingRetries = append(pendingRetries, e.collectAwaitingRetriesLocked()...)
+		}
 		e.mu.Unlock()
 
 		e.performWrites(ctx, plan)
@@ -804,7 +1106,9 @@ func (e *Engine) flush(ctx context.Context) {
 			e.mu.Unlock()
 			continue
 		}
-		e.armAwaitingRetriesLocked(pendingRetries)
+		if retryMode != awaitingRetryNone {
+			e.armAwaitingRetriesLocked(pendingRetries, retryMode == awaitingRetryImmediate)
+		}
 		e.rescheduleDeadlineLocked(now)
 		e.publishStatusLocked(now)
 		e.mu.Unlock()
@@ -838,23 +1142,31 @@ func (e *Engine) demoteExpiredLocked(now time.Time) bool {
 func (e *Engine) collectAwaitingRetriesLocked() []retrySchedule {
 	var retries []retrySchedule
 	for _, acct := range e.accounts {
-		if !acct.wantAwaitingRetry {
+		if !acct.wantAwaitingRetry || acct.reconcileFetchPending {
 			continue
 		}
 		acct.wantAwaitingRetry = false
-		retries = append(retries, retrySchedule{authIndex: acct.authIndex, epoch: acct.fetchEpoch})
+		retries = append(retries, retrySchedule{
+			authIndex: acct.authIndex,
+			epoch:     acct.fetchEpoch,
+			retrySeq:  acct.retrySeq,
+			immediate: acct.awaitingNeedsImmediate,
+		})
+		acct.awaitingNeedsImmediate = false
 	}
 	return retries
 }
 
-func (e *Engine) armAwaitingRetriesLocked(retries []retrySchedule) {
+func (e *Engine) armAwaitingRetriesLocked(retries []retrySchedule, immediate bool) {
 	for _, retry := range retries {
 		acct := e.accounts[retry.authIndex]
-		if acct == nil || acct.fetchEpoch != retry.epoch || acct.health == HealthQuarantined || acct.resetState != ResetAwaitingNewWindow {
+		if acct == nil || !e.cfg.Manages(acct.provider) || acct.fetchEpoch != retry.epoch ||
+			acct.retrySeq != retry.retrySeq || acct.reconcileFetchPending ||
+			acct.health == HealthQuarantined || acct.resetState != ResetAwaitingNewWindow {
 			continue
 		}
 		acct.wantRetrySchedule = false
-		e.startRetrySequenceLocked(acct, true)
+		e.startRetrySequenceLocked(acct, immediate || retry.immediate)
 	}
 }
 
@@ -933,15 +1245,15 @@ func (e *Engine) retryFetch(authIndex string, seq int) {
 	if !e.retryStillNeeded(authIndex, seq) {
 		return
 	}
-	e.fetchOne(ctx, authIndex)
-	e.flush(ctx)
+	e.fetchOneInternal(ctx, authIndex, false, seq)
+	e.flushAfterFetch(ctx)
 }
 
 func (e *Engine) retryStillNeeded(authIndex string, seq int) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	acct := e.accounts[authIndex]
-	return acct != nil && !e.stopped && seq == acct.retrySeq &&
+	return acct != nil && !e.stopped && e.cfg.Manages(acct.provider) && seq == acct.retrySeq &&
 		(acct.health == HealthRecovering || acct.resetState == ResetAwaitingNewWindow)
 }
 

@@ -34,6 +34,12 @@ const (
 	managementStatusPagePath = "/plugins/" + PluginID + "/status/html"
 	managementRefreshPath    = "/plugins/" + PluginID + "/refresh"
 	resourceStatusPath       = "/status"
+
+	// refreshRequestHeader makes the mutating management request non-simple in
+	// browsers, preventing an ambient reverse-proxy management credential from
+	// being ridden by a cross-origin HTML form POST.
+	refreshRequestHeader      = "X-Reset-Priority-Refresh"
+	refreshRequestHeaderValue = "1"
 )
 
 // Runtime dispatches host RPC calls and owns the engine lifecycle.
@@ -309,16 +315,107 @@ func (r *Runtime) handleManagement(request []byte) []byte {
 		return okEnvelope(jsonResponse(200, eng.Status()))
 
 	case method == "POST" && strings.HasSuffix(path, managementRefreshPath) && !isResourcePath(path):
-		// Authenticated "Refresh now" action (spec section 15).
-		eng.Reconcile(context.Background())
-		return okEnvelope(jsonResponse(200, map[string]any{
-			"status": "ok",
-			"detail": "reconciliation completed",
-		}))
+		// Authenticated "Refresh now" action (spec section 15). The custom
+		// non-simple header blocks cross-origin form submissions when a reverse
+		// proxy makes CPA management authentication ambient. Browser requests must
+		// also be explicitly same-origin (or navigation-origin "none") so a sibling
+		// site cannot use CPA's broad CORS preflight behavior to ride proxy auth.
+		if !refreshRequestAllowed(req.Headers) {
+			return okEnvelope(jsonResponse(403, map[string]string{
+				"status": "forbidden",
+				"detail": "refresh requires the plugin CSRF request header and same-origin browser metadata",
+			}))
+		}
+		ctx := hostapi.WithHostCallbackID(context.Background(), req.HostCallbackID)
+		switch eng.Reconcile(ctx) {
+		case engine.ReconcileResultSuccess:
+			return okEnvelope(jsonResponse(200, map[string]string{
+				"status": "ok",
+				"detail": "reconciliation completed",
+			}))
+		case engine.ReconcileResultNoOp:
+			return okEnvelope(jsonResponse(409, map[string]string{
+				"status": "no_op",
+				"detail": "reconciliation did not complete because the plugin is disabled or stopping",
+			}))
+		default:
+			return okEnvelope(jsonResponse(503, map[string]string{
+				"status": "error",
+				"detail": "roster reconciliation deferred; existing roster retained",
+			}))
+		}
 
 	default:
 		return okEnvelope(jsonResponse(404, map[string]string{"error": "unknown route"}))
 	}
+}
+
+func refreshRequestAllowed(headers map[string][]string) bool {
+	if !headerHasToken(headers, refreshRequestHeader, refreshRequestHeaderValue) {
+		return false
+	}
+
+	fetchSite, hasFetchSite := headerTokens(headers, "Sec-Fetch-Site")
+	if hasFetchSite {
+		if len(fetchSite) == 0 {
+			return false
+		}
+		for _, site := range fetchSite {
+			if !strings.EqualFold(site, "same-origin") && !strings.EqualFold(site, "none") {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Non-browser management clients normally send neither Origin nor fetch
+	// metadata. If Origin is present, fail closed unless the browser also supplied
+	// an explicitly allowed Sec-Fetch-Site value above.
+	return !headerPresent(headers, "Origin")
+}
+
+func headerHasToken(headers map[string][]string, name, token string) bool {
+	for key, values := range headers {
+		if !strings.EqualFold(strings.TrimSpace(key), name) {
+			continue
+		}
+		for _, value := range values {
+			for _, part := range strings.Split(value, ",") {
+				if strings.EqualFold(strings.TrimSpace(part), token) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func headerTokens(headers map[string][]string, name string) ([]string, bool) {
+	var tokens []string
+	present := false
+	for key, values := range headers {
+		if !strings.EqualFold(strings.TrimSpace(key), name) {
+			continue
+		}
+		present = true
+		for _, value := range values {
+			for _, part := range strings.Split(value, ",") {
+				if token := strings.TrimSpace(part); token != "" {
+					tokens = append(tokens, token)
+				}
+			}
+		}
+	}
+	return tokens, present
+}
+
+func headerPresent(headers map[string][]string, name string) bool {
+	for key := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), name) {
+			return true
+		}
+	}
+	return false
 }
 
 func isResourcePath(path string) bool {

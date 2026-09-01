@@ -17,6 +17,7 @@ import (
 // start. It honors ctx so a hung test cannot deadlock forever.
 type gateProvider struct {
 	id      string
+	token   string
 	started chan struct{}
 	release chan struct{}
 	result  func() (providers.Observation, error)
@@ -25,6 +26,9 @@ type gateProvider struct {
 func (p *gateProvider) ID() string { return p.id }
 
 func (p *gateProvider) FetchWeeklyReset(ctx context.Context, creds providers.Credentials) (providers.Observation, error) {
+	if p.token != "" && creds.AccessToken != p.token {
+		return p.result()
+	}
 	select {
 	case p.started <- struct{}{}:
 	default:
@@ -35,6 +39,28 @@ func (p *gateProvider) FetchWeeklyReset(ctx context.Context, creds providers.Cre
 		return providers.Observation{}, ctx.Err()
 	}
 	return p.result()
+}
+
+func waitForReconcileReservation(t *testing.T, eng *Engine, authIndex string) {
+	t.Helper()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		eng.mu.Lock()
+		acct := eng.accounts[authIndex]
+		reserved := acct != nil && acct.reconcileFetchPending
+		eng.mu.Unlock()
+		if reserved {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			t.Fatalf("reconcile did not reserve provider fetch for %s before blocking", authIndex)
+		}
+	}
 }
 
 // TestReconcileInvocationsSerialized: overlapping full reconciles (e.g.
@@ -80,6 +106,33 @@ func TestReconcileInvocationsSerialized(t *testing.T) {
 	env.assertDesired(map[string]int{"a": 100})
 }
 
+func TestReconcileReservesFetchBeforeWaitingForWriteback(t *testing.T) {
+	env := newTestEnv(t, defaultConfig())
+	env.addAccount("claude", "a", day(1))
+	env.reconcile()
+
+	// Model an exact-deadline flush already holding the writeback lane when a
+	// management reconciliation begins. The full pass must reserve its provider
+	// attempt before it waits on that local lock.
+	env.eng.writeMu.Lock()
+	var unlockOnce sync.Once
+	unlockWriteback := func() { unlockOnce.Do(env.eng.writeMu.Unlock) }
+	defer unlockWriteback()
+	done := make(chan struct{})
+	go func() {
+		env.eng.Reconcile(context.Background())
+		close(done)
+	}()
+
+	waitForReconcileReservation(t, env.eng, "idx-a")
+	unlockWriteback()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not finish after writeback lane release")
+	}
+}
+
 // TestDeadlineDemotionNotBlockedByReconcileNetworkFetch: while a full
 // reconcile is stuck in provider network work, the exact deadline event must
 // still demote and write back synchronously.
@@ -95,6 +148,7 @@ func TestDeadlineDemotionNotBlockedByReconcileNetworkFetch(t *testing.T) {
 	// fetch phase (holding the reconcile mutex).
 	gate := &gateProvider{
 		id:      "claude",
+		token:   token("a"),
 		started: make(chan struct{}, 8),
 		release: make(chan struct{}),
 		result: func() (providers.Observation, error) {
@@ -122,8 +176,181 @@ func TestDeadlineDemotionNotBlockedByReconcileNetworkFetch(t *testing.T) {
 
 	close(gate.release)
 	wg.Wait()
-	// The late fetch failure cannot re-promote a.
+	// The late fetch failure cannot re-promote a, and because that request began
+	// before demotion it cannot count as the required post-demotion immediate
+	// attempt. One fresh asynchronous attempt must be queued after writeback.
 	env.assertDesired(map[string]int{"b": 200, "a": 100})
+	if pending := env.async.pending(); pending != 1 {
+		t.Fatalf("pre-deadline reconcile result queued %d post-demotion immediate attempts, want 1", pending)
+	}
+}
+
+func TestRetryCollectedBeforeReconcileReservationCannotArmAfterward(t *testing.T) {
+	env := newTestEnv(t, defaultConfig())
+	deadline := baseTime.Add(30 * time.Minute)
+	env.addAccount("claude", "a", deadline)
+	env.addAccount("claude", "b", deadline.Add(24*time.Hour))
+	env.reconcile()
+	env.clk.Set(deadline.Add(-time.Nanosecond))
+
+	writeStarted := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	var blockMu sync.Mutex
+	blocked := false
+	env.host.beforeSave = func(string) {
+		blockMu.Lock()
+		if blocked {
+			blockMu.Unlock()
+			return
+		}
+		blocked = true
+		blockMu.Unlock()
+		close(writeStarted)
+		<-releaseWrite
+	}
+	var releaseWriteOnce sync.Once
+	allowWrite := func() { releaseWriteOnce.Do(func() { close(releaseWrite) }) }
+	defer allowWrite()
+
+	gate := &gateProvider{
+		id:      "claude",
+		token:   token("a"),
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+		result: func() (providers.Observation, error) {
+			return providers.Observation{}, errFake("provider unavailable")
+		},
+	}
+	env.eng.providers = map[string]providers.Provider{"claude": gate}
+	var releaseProviderOnce sync.Once
+	allowProvider := func() { releaseProviderOnce.Do(func() { close(gate.release) }) }
+	defer allowProvider()
+
+	deadlineDone := make(chan struct{})
+	go func() {
+		env.clk.Advance(time.Nanosecond)
+		close(deadlineDone)
+	}()
+	select {
+	case <-writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("deadline flush did not reach writeback")
+	}
+
+	reconcileDone := make(chan struct{})
+	go func() {
+		env.eng.Reconcile(context.Background())
+		close(reconcileDone)
+	}()
+	waitForReconcileReservation(t, env.eng, "idx-a")
+	allowWrite()
+	select {
+	case <-deadlineDone:
+	case <-time.After(time.Second):
+		t.Fatal("deadline flush did not finish after write release")
+	}
+	select {
+	case <-gate.started:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not reach its provider call")
+	}
+
+	// The deadline flush collected its retry before writeback, but the later
+	// full-pass reservation invalidated that schedule. It must not arm a detached
+	// immediate task after writeback completes.
+	if pending := env.async.pending(); pending != 0 {
+		t.Fatalf("stale collected retry armed %d detached immediate tasks, want 0", pending)
+	}
+
+	allowProvider()
+	select {
+	case <-reconcileDone:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not finish after provider release")
+	}
+}
+
+func TestReconcilePreadmissionFailureRestoresCollectedImmediateRetry(t *testing.T) {
+	env := newTestEnv(t, defaultConfig())
+	deadline := baseTime.Add(30 * time.Minute)
+	env.addAccount("claude", "a", deadline)
+	env.addAccount("claude", "b", deadline.Add(24*time.Hour))
+	env.reconcile()
+	env.clk.Set(deadline.Add(-time.Nanosecond))
+
+	writeStarted := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	var blockMu sync.Mutex
+	blocked := false
+	env.host.beforeSave = func(string) {
+		blockMu.Lock()
+		if blocked {
+			blockMu.Unlock()
+			return
+		}
+		blocked = true
+		blockMu.Unlock()
+		close(writeStarted)
+		<-releaseWrite
+	}
+	var releaseWriteOnce sync.Once
+	allowWrite := func() { releaseWriteOnce.Do(func() { close(releaseWrite) }) }
+	defer allowWrite()
+
+	deadlineDone := make(chan struct{})
+	go func() {
+		env.clk.Advance(time.Nanosecond)
+		close(deadlineDone)
+	}()
+	select {
+	case <-writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("deadline flush did not reach writeback")
+	}
+
+	// Let roster validation succeed, then fail A's second reconcile read—the
+	// credential read immediately before provider admission.
+	var readMu sync.Mutex
+	aReads := 0
+	env.host.beforeGet = func(authIndex string) {
+		if authIndex != "idx-a" {
+			return
+		}
+		readMu.Lock()
+		aReads++
+		fail := aReads == 2
+		readMu.Unlock()
+		if fail {
+			env.host.mu.Lock()
+			env.host.getErr[authIndex] = errFake("credential read unavailable")
+			env.host.mu.Unlock()
+		}
+	}
+
+	reconcileDone := make(chan struct{})
+	go func() {
+		env.eng.Reconcile(context.Background())
+		close(reconcileDone)
+	}()
+	waitForReconcileReservation(t, env.eng, "idx-a")
+	allowWrite()
+	select {
+	case <-deadlineDone:
+	case <-time.After(time.Second):
+		t.Fatal("deadline flush did not finish after write release")
+	}
+	select {
+	case <-reconcileDone:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not finish after credential read failure")
+	}
+
+	// The stale retry collected by the deadline flush was invalidated by the full
+	// pass, but that replacement never reached provider admission. A new immediate
+	// post-demotion attempt must therefore be queued, not deferred to +5s.
+	if pending := env.async.pending(); pending != 1 {
+		t.Fatalf("preadmission reconcile failure queued %d immediate retries, want 1", pending)
+	}
 }
 
 // TestDeadlineCrossedDuringWritebackGetsSecondSynchronousPass verifies that a

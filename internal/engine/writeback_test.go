@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/NoorChasib/cpa-plugin-reset-priority/internal/hostapi"
+	"github.com/NoorChasib/cpa-plugin-reset-priority/internal/providers"
 )
 
 // richDoc builds an auth JSON doc with many unrelated fields, including
@@ -246,6 +248,281 @@ func TestDryRunPerformsZeroSaves(t *testing.T) {
 	env.async.drain()
 	if got := env.host.saveCount(); got != 0 {
 		t.Errorf("dry-run deadline handling performed %d saves, want 0", got)
+	}
+}
+
+func TestDryRunReconfigureBlocksSaveAfterReadBeforeWrite(t *testing.T) {
+	env := newTestEnv(t, defaultConfig())
+	env.addAccount("claude", "a", day(1))
+
+	writeReadStarted := make(chan struct{})
+	releaseWriteRead := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-releaseWriteRead:
+		default:
+			close(releaseWriteRead)
+		}
+	})
+	getCalls := 0
+	env.host.beforeGet = func(authIndex string) {
+		if authIndex != "idx-a" {
+			return
+		}
+		getCalls++
+		if getCalls != 3 { // validation, provider fetch, then read-before-write
+			return
+		}
+		close(writeReadStarted)
+		<-releaseWriteRead
+	}
+
+	reconciled := make(chan struct{})
+	go func() {
+		env.eng.Reconcile(context.Background())
+		close(reconciled)
+	}()
+	select {
+	case <-writeReadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not reach the blocked read-before-write")
+	}
+
+	dryRun := defaultConfig()
+	dryRun.DryRun = true
+	reconfigured := make(chan struct{})
+	go func() {
+		env.eng.Reconfigure(dryRun)
+		close(reconfigured)
+	}()
+	select {
+	case <-reconfigured:
+	case <-time.After(time.Second):
+		t.Fatal("dry-run reconfiguration did not return while a write read was blocked")
+	}
+
+	close(releaseWriteRead)
+	select {
+	case <-reconciled:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not finish after the write read was released")
+	}
+	if got := env.host.saveCount(); got != 0 {
+		t.Fatalf("dry-run reconfiguration allowed %d save(s) after it returned, want 0", got)
+	}
+}
+
+func TestProviderOptOutInvalidatesWriteBlockedBeforeSaveAdmission(t *testing.T) {
+	env := newTestEnv(t, defaultConfig())
+	env.addAccount("claude", "a", day(1))
+
+	writeReadStarted := make(chan struct{})
+	releaseWriteRead := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-releaseWriteRead:
+		default:
+			close(releaseWriteRead)
+		}
+	})
+	getCalls := 0
+	env.host.beforeGet = func(authIndex string) {
+		if authIndex != "idx-a" {
+			return
+		}
+		getCalls++
+		if getCalls != 3 { // validation, provider fetch, then read-before-write
+			return
+		}
+		close(writeReadStarted)
+		<-releaseWriteRead
+	}
+
+	reconciled := make(chan struct{})
+	go func() {
+		env.eng.Reconcile(context.Background())
+		close(reconciled)
+	}()
+	select {
+	case <-writeReadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not reach the blocked read-before-write")
+	}
+
+	cfg := defaultConfig()
+	cfg.ManageClaude = false
+	env.eng.Reconfigure(cfg)
+	close(releaseWriteRead)
+	select {
+	case <-reconciled:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not finish after the write read was released")
+	}
+	if got := env.host.saveCount(); got != 0 {
+		t.Fatalf("provider opt-out allowed %d stale save(s), want 0", got)
+	}
+}
+
+func TestProviderOptOutStopsFetchBlockedBeforeProviderAdmission(t *testing.T) {
+	env := newTestEnv(t, defaultConfig())
+	env.addAccount("claude", "a", day(1))
+	env.reconcile()
+	before := env.claude.callCount(token("a"))
+
+	readStarted := make(chan struct{})
+	releaseRead := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-releaseRead:
+		default:
+			close(releaseRead)
+		}
+	})
+	env.host.beforeGet = func(authIndex string) {
+		if authIndex != "idx-a" {
+			return
+		}
+		close(readStarted)
+		<-releaseRead
+	}
+
+	fetchDone := make(chan struct{})
+	go func() {
+		env.eng.fetchOne(context.Background(), "idx-a")
+		close(fetchDone)
+	}()
+	select {
+	case <-readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("fetch did not reach the blocked credential read")
+	}
+
+	cfg := defaultConfig()
+	cfg.ManageClaude = false
+	env.eng.Reconfigure(cfg)
+	close(releaseRead)
+	select {
+	case <-fetchDone:
+	case <-time.After(time.Second):
+		t.Fatal("fetch did not finish after credential read release")
+	}
+	if got := env.claude.callCount(token("a")); got != before {
+		t.Fatalf("provider opt-out allowed %d new provider call(s), want 0", got-before)
+	}
+}
+
+func TestProviderOptOutWaitsForAlreadyAdmittedProviderCall(t *testing.T) {
+	env := newTestEnv(t, defaultConfig())
+	env.addAccount("claude", "a", day(1))
+	env.reconcile()
+
+	call := &controlledFetch{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		obs: providers.Observation{
+			HasWeekly:  true,
+			ResetAt:    day(2),
+			ObservedAt: env.clk.Now(),
+		},
+	}
+	controlled := &controlledProvider{id: "claude", calls: []*controlledFetch{call}}
+	env.eng.providers = map[string]providers.Provider{"claude": controlled}
+
+	fetchDone := make(chan struct{})
+	go func() {
+		env.eng.fetchOne(context.Background(), "idx-a")
+		close(fetchDone)
+	}()
+	select {
+	case <-call.started:
+	case <-time.After(time.Second):
+		t.Fatal("provider call did not start")
+	}
+
+	cfg := defaultConfig()
+	cfg.ManageClaude = false
+	reconfigured := make(chan struct{})
+	go func() {
+		env.eng.Reconfigure(cfg)
+		close(reconfigured)
+	}()
+	select {
+	case <-reconfigured:
+		t.Fatal("provider opt-out returned while an admitted provider call was in flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(call.release)
+	select {
+	case <-fetchDone:
+	case <-time.After(time.Second):
+		t.Fatal("provider fetch did not finish after release")
+	}
+	select {
+	case <-reconfigured:
+	case <-time.After(time.Second):
+		t.Fatal("provider opt-out did not return after admitted call completed")
+	}
+}
+
+func TestDryRunReconfigureWaitsForAlreadyAuthorizedSave(t *testing.T) {
+	env := newTestEnv(t, defaultConfig())
+	env.addAccount("claude", "a", day(1))
+
+	saveStarted := make(chan struct{})
+	releaseSave := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-releaseSave:
+		default:
+			close(releaseSave)
+		}
+	})
+	env.host.beforeSave = func(name string) {
+		if name != "a.json" {
+			return
+		}
+		close(saveStarted)
+		<-releaseSave
+	}
+
+	reconciled := make(chan struct{})
+	go func() {
+		env.eng.Reconcile(context.Background())
+		close(reconciled)
+	}()
+	select {
+	case <-saveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not reach the blocked authorized save")
+	}
+
+	dryRun := defaultConfig()
+	dryRun.DryRun = true
+	reconfigured := make(chan struct{})
+	go func() {
+		env.eng.Reconfigure(dryRun)
+		close(reconfigured)
+	}()
+	select {
+	case <-reconfigured:
+		t.Fatal("dry-run reconfiguration returned while an authorized save was still in flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseSave)
+	select {
+	case <-reconfigured:
+	case <-time.After(time.Second):
+		t.Fatal("dry-run reconfiguration did not return after the authorized save completed")
+	}
+	select {
+	case <-reconciled:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not finish after the authorized save completed")
+	}
+	if got := env.host.saveCount(); got != 1 {
+		t.Fatalf("save count = %d, want the one already-authorized save", got)
 	}
 }
 

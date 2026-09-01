@@ -104,6 +104,15 @@ type account struct {
 	// expired reset. The next flush consumes it only after synchronous demotion
 	// writeback, then arms the immediate passive fetch and bounded retries.
 	wantAwaitingRetry bool
+	// awaitingNeedsImmediate distinguishes an expiry discovered only after a
+	// pre-deadline provider attempt returned. That attempt cannot count as the
+	// required post-demotion immediate retry, even when a full reconcile owns it.
+	awaitingNeedsImmediate bool
+	// reconcileFetchPending reserves this account's immediate provider attempt
+	// for the active full reconciliation. Exact-deadline flushes still demote and
+	// persist synchronously, but leave retry intent for that already-owned fetch
+	// instead of launching a duplicate detached request.
+	reconcileFetchPending bool
 }
 
 // stableKey is the deterministic tie-break key (spec section 12).

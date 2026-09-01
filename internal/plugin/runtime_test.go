@@ -25,10 +25,11 @@ type fakeHostCaller struct {
 	mu        sync.Mutex
 	entries   []hostapi.AuthEntry
 	docs      map[string]json.RawMessage // by auth index
-	httpBody  map[string]string          // URL -> body
+	httpBody  map[string]string          // bearer token -> body
 	httpCalls []hostapi.HTTPRequest
 	saves     []hostapi.AuthSaveRequest
 	logs      []hostapi.LogRequest
+	listErr   error
 }
 
 func newFakeHostCaller() *fakeHostCaller {
@@ -51,6 +52,9 @@ func (c *fakeHostCaller) Call(method string, request []byte) ([]byte, error) {
 	defer c.mu.Unlock()
 	switch method {
 	case hostapi.MethodHostAuthList:
+		if c.listErr != nil {
+			return nil, c.listErr
+		}
 		return ok(hostapi.AuthListResponse{Files: append([]hostapi.AuthEntry(nil), c.entries...)})
 	case hostapi.MethodHostAuthGet:
 		var req hostapi.AuthGetRequest
@@ -171,6 +175,18 @@ func (c *fakeHostCaller) httpCallCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.httpCalls)
+}
+
+func (c *fakeHostCaller) httpCallsSince(offset int) []hostapi.HTTPRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]hostapi.HTTPRequest(nil), c.httpCalls[offset:]...)
+}
+
+func (c *fakeHostCaller) setListError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.listErr = err
 }
 
 func (c *fakeHostCaller) saveCount() int {
@@ -462,7 +478,28 @@ func statusSnapshot(t *testing.T, rt *Runtime) engine.Snapshot {
 
 func managementCall(t *testing.T, rt *Runtime, method, path string, query map[string][]string) hostapi.ManagementResponse {
 	t.Helper()
-	reqRaw, err := json.Marshal(hostapi.ManagementRequest{Method: method, Path: path, Query: query})
+	return managementRequest(t, rt, hostapi.ManagementRequest{Method: method, Path: path, Query: query})
+}
+
+func refreshCall(t *testing.T, rt *Runtime, headers map[string][]string, callbackID string) hostapi.ManagementResponse {
+	t.Helper()
+	if headers == nil {
+		headers = make(map[string][]string)
+	}
+	if _, present := headers[refreshRequestHeader]; !present {
+		headers[refreshRequestHeader] = []string{refreshRequestHeaderValue}
+	}
+	return managementRequest(t, rt, hostapi.ManagementRequest{
+		Method:         "POST",
+		Path:           "/v0/management/plugins/reset-priority/refresh",
+		Headers:        headers,
+		HostCallbackID: callbackID,
+	})
+}
+
+func managementRequest(t *testing.T, rt *Runtime, req hostapi.ManagementRequest) hostapi.ManagementResponse {
+	t.Helper()
+	reqRaw, err := json.Marshal(req)
 	if err != nil {
 		t.Fatal(err)
 	}
