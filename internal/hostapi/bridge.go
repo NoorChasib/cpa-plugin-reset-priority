@@ -28,11 +28,22 @@ type Bridge struct {
 	caller    Caller
 	accepting bool
 	inFlight  int
+
+	// limiter caps concurrent native callbacks process-wide. It is immutable
+	// after construction, and b.mu is always taken before the limiter's own
+	// lock (the limiter never takes b.mu, so the order cannot invert).
+	limiter *callbackLimiter
 }
 
-// NewBridge wraps a raw Caller.
+// NewBridge wraps a raw Caller, bound by the process-wide callback limit.
 func NewBridge(caller Caller) *Bridge {
-	b := &Bridge{caller: caller, accepting: true}
+	return newBridgeWithLimiter(caller, globalCallbackLimiter)
+}
+
+// newBridgeWithLimiter builds a Bridge over an explicit limiter so tests can
+// exercise saturation without consuming process-wide capacity.
+func newBridgeWithLimiter(caller Caller, limiter *callbackLimiter) *Bridge {
+	b := &Bridge{caller: caller, accepting: true, limiter: limiter}
 	b.drained = sync.NewCond(&b.mu)
 	return b
 }
@@ -61,6 +72,10 @@ func (b *Bridge) Quiesce() {
 // a host callback (typically host.http.do with no host-side deadline) never
 // returns, terminal native shutdown blocks inside the host's unload path
 // until CPA itself exits. See docs/troubleshooting.md.
+//
+// The set of callbacks Drain waits on is finite by construction: admission is
+// capped at MaxInFlightHostCallbacks, so a misbehaving host can stall shutdown
+// but cannot grow the drain set without bound while it does.
 func (b *Bridge) Drain() {
 	if b == nil {
 		return
@@ -73,6 +88,13 @@ func (b *Bridge) Drain() {
 	b.mu.Unlock()
 }
 
+// acquireCaller admits one native callback, taking both the bridge's in-flight
+// count (which Drain waits on) and one process-wide admission. The two are
+// taken and returned together under b.mu so they can never disagree about how
+// many callbacks are inside the host.
+//
+// Shutdown outranks saturation: a caller arriving during shutdown learns the
+// bridge is closing rather than that it is momentarily full.
 func (b *Bridge) acquireCaller() (Caller, error) {
 	if b == nil {
 		return nil, fmt.Errorf("host bridge is unavailable")
@@ -85,17 +107,34 @@ func (b *Bridge) acquireCaller() (Caller, error) {
 	if b.caller == nil {
 		return nil, fmt.Errorf("host bridge is unavailable")
 	}
+	if !b.callbackLimiter().acquire() {
+		return nil, ErrHostCallbackLimit
+	}
 	b.inFlight++
 	return b.caller, nil
 }
 
+// releaseCaller returns one admission. Callers must invoke it only after the
+// native call has actually returned, never when a Go context ends early: an
+// abandoned callback is still inside the host and must keep its admission.
 func (b *Bridge) releaseCaller() {
 	b.mu.Lock()
 	b.inFlight--
+	b.callbackLimiter().release()
 	if b.inFlight == 0 {
 		b.drained.Broadcast()
 	}
 	b.mu.Unlock()
+}
+
+// callbackLimiter returns the bridge's limiter, defaulting to the process-wide
+// one. Falling back rather than skipping the bound keeps a Bridge that somehow
+// bypassed the constructors limited instead of silently unbounded.
+func (b *Bridge) callbackLimiter() *callbackLimiter {
+	if b.limiter == nil {
+		return globalCallbackLimiter
+	}
+	return b.limiter
 }
 
 func marshalRequest(method string, payload any) ([]byte, error) {
@@ -203,14 +242,24 @@ func (b *Bridge) AuthSave(ctx context.Context, name string, doc json.RawMessage)
 // goroutine and this method returns as soon as ctx is cancelled or its
 // deadline passes (making request-timeout effective for the engine). The
 // underlying native callback cannot be cancelled. It continues in the
-// background, remains counted as in-flight, and is drained during native
-// plugin shutdown before the host function table may be released.
+// background, keeps its in-flight admission for as long as it remains inside
+// the host, and is drained during native plugin shutdown before the host
+// function table may be released.
+//
+// Because a host with no deadline of its own turns every request-timeout into a
+// permanently stuck callback, admission is capped at MaxInFlightHostCallbacks
+// process-wide; once that many callbacks are stuck, further calls fail fast
+// with ErrHostCallbackLimit instead of entering the host and pinning another
+// OS thread.
 func (b *Bridge) HTTPDo(ctx context.Context, req HTTPRequest) (HTTPResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
 		return HTTPResponse{}, err
+	}
+	if req.HostCallbackID == "" {
+		req.HostCallbackID = HostCallbackIDFromContext(ctx)
 	}
 
 	raw, errMarshal := marshalRequest(MethodHostHTTPDo, req)
@@ -229,6 +278,15 @@ func (b *Bridge) HTTPDo(ctx context.Context, req HTTPRequest) (HTTPResponse, err
 	resultCh := make(chan httpResult, 1)
 	go func() {
 		defer b.releaseCaller()
+		// Cancellation can win before this newly admitted worker is scheduled. In
+		// that case do not enter CPA later with a callback ID whose management
+		// request may already have unwound. Once invoke begins, ABI v1 provides no
+		// entry acknowledgement or cancellation primitive; the bounded admission
+		// and Drain rules below still apply to that unavoidable narrow race.
+		if err := ctx.Err(); err != nil {
+			resultCh <- httpResult{err: err}
+			return
+		}
 		var resp HTTPResponse
 		err := invoke(caller, MethodHostHTTPDo, raw, &resp)
 		resultCh <- httpResult{resp: resp, err: err}

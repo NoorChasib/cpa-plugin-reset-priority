@@ -124,7 +124,8 @@ func TestBridgeHTTPDoWireShapes(t *testing.T) {
 	raw := fmt.Sprintf(`{"ok":true,"result":{"StatusCode":200,"Headers":{"Content-Type":["application/json"]},"Body":%q}}`, body)
 	caller := &scriptedCaller{response: []byte(raw)}
 
-	resp, err := NewBridge(caller).HTTPDo(context.Background(), HTTPRequest{
+	ctx := WithHostCallbackID(context.Background(), "request-context-123")
+	resp, err := NewBridge(caller).HTTPDo(ctx, HTTPRequest{
 		Method:  "GET",
 		URL:     "https://example.com/usage",
 		Headers: map[string][]string{"Authorization": {"Bearer x"}},
@@ -136,9 +137,15 @@ func TestBridgeHTTPDoWireShapes(t *testing.T) {
 		t.Errorf("resp = %+v", resp)
 	}
 
-	// The request uses snake_case keys.
+	// The request uses snake_case keys and carries the management callback ID
+	// so the host can resolve the originating request's cancellation context.
 	req := caller.calls[0].Request
-	for _, want := range []string{`"method":"GET"`, `"url":"https://example.com/usage"`, `"headers":{"Authorization":["Bearer x"]}`} {
+	for _, want := range []string{
+		`"host_callback_id":"request-context-123"`,
+		`"method":"GET"`,
+		`"url":"https://example.com/usage"`,
+		`"headers":{"Authorization":["Bearer x"]}`,
+	} {
 		if !strings.Contains(req, want) {
 			t.Errorf("request missing %s: %s", want, req)
 		}

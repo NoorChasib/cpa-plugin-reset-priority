@@ -72,6 +72,7 @@ import "C"
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"unsafe"
@@ -125,8 +126,35 @@ func nativeInitAllowed() bool {
 	return !nativeShuttingDown
 }
 
+const maxCGoBytesLength = 1<<31 - 1
+
+var errNativeBufferTooLarge = errors.New("native buffer length exceeds C.GoBytes limit")
+
 // cgoHostCaller invokes host callbacks through the stored host API.
 type cgoHostCaller struct{}
+
+// copyNativeBytes is the Go-facing seam around C.GoBytes used by both native
+// ingress paths.
+func copyNativeBytes(ptr unsafe.Pointer, length C.size_t) ([]byte, error) {
+	if length > C.size_t(maxCGoBytesLength) {
+		return nil, errNativeBufferTooLarge
+	}
+	if ptr == nil || length == 0 {
+		return nil, nil
+	}
+	return C.GoBytes(ptr, C.int(length)), nil
+}
+
+func consumeHostResponse(ptr unsafe.Pointer, length C.size_t, release func()) ([]byte, error) {
+	if ptr != nil {
+		defer release()
+	}
+	return copyNativeBytes(ptr, length)
+}
+
+func readPluginRequest(ptr unsafe.Pointer, length C.size_t) ([]byte, error) {
+	return copyNativeBytes(ptr, length)
+}
 
 // Call implements hostapi.Caller.
 func (cgoHostCaller) Call(method string, request []byte) ([]byte, error) {
@@ -143,12 +171,11 @@ func (cgoHostCaller) Call(method string, request []byte) ([]byte, error) {
 	var response C.cliproxy_buffer
 	code := C.reset_priority_call_host(cMethod, requestPtr, C.size_t(len(request)), &response)
 
-	var raw []byte
-	if response.ptr != nil && response.len > 0 {
-		raw = C.GoBytes(response.ptr, C.int(response.len))
-	}
-	if response.ptr != nil {
+	raw, err := consumeHostResponse(response.ptr, response.len, func() {
 		C.reset_priority_free_host_buffer(response.ptr, response.len)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("host callback %s returned invalid response: %w", method, err)
 	}
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("host callback %s returned no response (code %d)", method, int(code))
@@ -206,9 +233,9 @@ func resetPriorityPluginCall(method *C.char, request *C.uint8_t, requestLen C.si
 	if method == nil {
 		return 1
 	}
-	var requestBytes []byte
-	if request != nil && requestLen > 0 {
-		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
+	requestBytes, err := readPluginRequest(unsafe.Pointer(request), requestLen)
+	if err != nil {
+		return 1
 	}
 	envelope := pluginRuntime().Dispatch(C.GoString(method), requestBytes)
 	writePluginResponse(response, envelope)

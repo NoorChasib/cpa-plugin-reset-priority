@@ -172,7 +172,11 @@ type AuthEntry struct {
 	Email         string    `json:"email,omitempty"`
 	Priority      int       `json:"priority,omitempty"`
 	LastRefresh   time.Time `json:"last_refresh,omitempty"`
-	ModTime       time.Time `json:"mod_time,omitempty"`
+	// ModTime is the physical auth file's modification time. The audited host
+	// key is "modtime" (no underscore); the snake_case spelling binds nothing
+	// and would silently zero the field, which the engine would read as
+	// "no file was touched" rather than as a decode failure.
+	ModTime time.Time `json:"modtime,omitempty"`
 }
 
 // AuthListResponse is the host.auth.list result.
@@ -226,10 +230,14 @@ type AuthSaveResponse struct {
 
 // HTTPRequest is the host.http.do request (snake_case keys; Body base64).
 type HTTPRequest struct {
-	Method  string              `json:"method,omitempty"`
-	URL     string              `json:"url,omitempty"`
-	Headers map[string][]string `json:"headers,omitempty"`
-	Body    []byte              `json:"body,omitempty"`
+	// HostCallbackID links this callback to the host-side context of the native
+	// request that caused it. CPA resolves the ID before issuing HTTP so a
+	// disconnected management request can cancel its provider request.
+	HostCallbackID string              `json:"host_callback_id,omitempty"`
+	Method         string              `json:"method,omitempty"`
+	URL            string              `json:"url,omitempty"`
+	Headers        map[string][]string `json:"headers,omitempty"`
+	Body           []byte              `json:"body,omitempty"`
 }
 
 // HTTPResponse is the host.http.do result. Upstream returns the untagged
