@@ -437,6 +437,48 @@ func TestResourceStatusPageIsStaticAndReadOnly(t *testing.T) {
 	}
 }
 
+func TestResourceStatusPageSameOriginUpgradeScript(t *testing.T) {
+	caller := newFakeHostCaller()
+	rt := newTestRuntime(t, caller)
+	registerRuntime(t, rt, "enabled: true\n")
+
+	resp := managementCall(t, rt, "GET", "/v0/resource/plugins/reset-priority/status", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("resource page = %d, want 200", resp.StatusCode)
+	}
+	page := string(resp.Body)
+
+	// The shell must carry the client-side upgrade: helper namespace, the
+	// management-console localStorage keys and obfuscation prefix, the
+	// authenticated HTML route fetch, and the fallback note element.
+	for _, marker := range []string{
+		"resetPriorityAuth",
+		`"cli-proxy-auth"`,
+		`"managementKey"`,
+		`"enc::v1::"`,
+		`managementPath("/status/html")`,
+		`credentials: "same-origin"`,
+		`id="reset-priority-session-note"`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Errorf("resource page missing upgrade-script marker %q", marker)
+		}
+	}
+
+	// The Authorization value must be assembled from parts; the contiguous
+	// bearer-credential prefix must never appear in page source.
+	if strings.Contains(page, "Bearer ") {
+		t.Errorf("resource page contains contiguous bearer prefix")
+	}
+
+	// CSP must keep permitting the inline script and the same-origin fetch.
+	if csp := resp.Headers["Content-Security-Policy"]; len(csp) == 0 ||
+		!strings.Contains(csp[0], "script-src 'unsafe-inline'") ||
+		!strings.Contains(csp[0], "connect-src 'self'") {
+		t.Errorf("content security policy = %v", csp)
+	}
+}
+
 func TestManagementStatusPageRendersSanitizedHTML(t *testing.T) {
 	caller := newFakeHostCaller()
 	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))

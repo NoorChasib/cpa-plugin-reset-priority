@@ -98,7 +98,7 @@ Next reset deadline: {{if .NextDeadlineAt}}{{.NextDeadlineAt}}{{else}}not schedu
 <p>
 <button id="refresh-now" type="button">Refresh now</button><span id="refresh-result"></span>
 </p>
-<p class="meta">Refresh now issues <code>POST /v0/management/plugins/reset-priority/refresh</code> on the same origin with the required plugin CSRF header, preserves the query string, and then reloads. CPA must receive the management authentication header through the browser or reverse-proxy setup; query parameters are not management credentials.</p>
+<p class="meta">Refresh now issues <code>POST /v0/management/plugins/reset-priority/refresh</code> on the same origin with the required plugin CSRF header, preserves the query string, and then reloads. CPA must receive the management authentication header through the browser, a same-origin management-console session, or the reverse-proxy setup; query parameters are not management credentials.</p>
 {{range .Providers}}
 <h2>{{.Provider}}</h2>
 {{if .Accounts}}
@@ -128,7 +128,7 @@ Next reset deadline: {{if .NextDeadlineAt}}{{.NextDeadlineAt}}{{else}}not schedu
 <p class="empty">No managed accounts discovered for this provider.</p>
 {{end}}
 {{end}}
-<script>
+<script>` + browserAuthScript + `
 (function () {
 	var button = document.getElementById("refresh-now");
 	var result = document.getElementById("refresh-result");
@@ -138,11 +138,12 @@ Next reset deadline: {{if .NextDeadlineAt}}{{.NextDeadlineAt}}{{else}}not schedu
 	button.addEventListener("click", function () {
 		button.disabled = true;
 		result.textContent = "Refreshing…";
-		var refreshURL = location.pathname.replace(/\/status\/html\/?$/, "/refresh") + location.search;
+		var auth = window.resetPriorityAuth;
+		var refreshURL = auth.managementPath("/refresh") + location.search;
 		fetch(refreshURL, {
 			method: "POST",
 			credentials: "same-origin",
-			headers: { "X-Reset-Priority-Refresh": "1" }
+			headers: auth.authHeaders({ "X-Reset-Priority-Refresh": "1" })
 		})
 			.then(function (resp) {
 				if (resp.ok) {

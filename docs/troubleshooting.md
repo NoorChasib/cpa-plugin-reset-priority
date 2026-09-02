@@ -64,7 +64,7 @@ Do not post complete debug logs without reviewing them for unrelated secrets.
   ```
 
 - The management routes require CPA management authentication. Refresh POSTs additionally require `X-Reset-Priority-Refresh: 1`. Browser requests are accepted only with `Sec-Fetch-Site: same-origin` or `none`; `same-site`, `cross-site`, invalid/empty metadata, and `Origin` without fetch metadata are rejected. Non-browser clients may omit browser metadata.
-- The resource route is a static, account-free readiness shell and is read-only and unauthenticated under CPA's resource model.
+- The resource route is a static, account-free readiness shell and is read-only and unauthenticated under CPA's resource model. Its inline script upgrades the view client-side to the authenticated `status/html` page when the browser holds a same-origin management session (a management-console key remembered in localStorage on the same origin, ambient reverse-proxy auth, or cookies); without one it shows the shell plus a note. If the sidebar page stays on the shell, sign in to the management console served from the same origin as CPA with `Remember password` enabled, or check that the console is not hosted on a different origin.
 - Restart CPA after first installing a native library.
 
 ## The status route returns 503

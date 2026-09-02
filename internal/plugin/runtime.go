@@ -22,7 +22,7 @@ import (
 const (
 	PluginID      = "reset-priority"
 	PluginName    = "Reset Priority"
-	PluginVersion = "0.1.1"
+	PluginVersion = "0.1.2"
 	PluginAuthor  = "NoorChasib"
 	PluginRepo    = "https://github.com/NoorChasib/cpa-plugin-reset-priority"
 )
@@ -290,6 +290,9 @@ func (r *Runtime) handleManagement(request []byte) []byte {
 		// Static read-only browser shell. Resource routes are NOT management-
 		// authenticated, so this handler exposes no snapshot, performs no
 		// mutations, and accepts no operations regardless of query parameters.
+		// The shell's embedded script may upgrade the view client-side by
+		// fetching the authenticated management HTML route, but only with
+		// credentials the browser itself already holds.
 		return okEnvelope(htmlResponse(200, renderStatusPage()))
 	}
 
