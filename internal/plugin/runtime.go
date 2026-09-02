@@ -22,7 +22,7 @@ import (
 const (
 	PluginID      = "reset-priority"
 	PluginName    = "Reset Priority"
-	PluginVersion = "0.1.0"
+	PluginVersion = "0.1.1"
 	PluginAuthor  = "NoorChasib"
 	PluginRepo    = "https://github.com/NoorChasib/cpa-plugin-reset-priority"
 )
@@ -461,7 +461,7 @@ func htmlResponse(status int, body []byte) hostapi.ManagementResponse {
 			"Content-Type":            {"text/html; charset=utf-8"},
 			"Cache-Control":           {"no-store"},
 			"X-Content-Type-Options":  {"nosniff"},
-			"Content-Security-Policy": {"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"},
+			"Content-Security-Policy": {"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"},
 		},
 		Body: body,
 	}

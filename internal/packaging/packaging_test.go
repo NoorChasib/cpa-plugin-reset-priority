@@ -25,11 +25,11 @@ func TestPluginIDMatchesStoreRules(t *testing.T) {
 func TestArchiveNamesMatchStoreExpectations(t *testing.T) {
 	// Spec section 28.2 exact release asset names.
 	want := map[[2]string]string{
-		{"linux", "amd64"}:   "reset-priority_0.1.0_linux_amd64.zip",
-		{"linux", "arm64"}:   "reset-priority_0.1.0_linux_arm64.zip",
-		{"darwin", "amd64"}:  "reset-priority_0.1.0_darwin_amd64.zip",
-		{"darwin", "arm64"}:  "reset-priority_0.1.0_darwin_arm64.zip",
-		{"windows", "amd64"}: "reset-priority_0.1.0_windows_amd64.zip",
+		{"linux", "amd64"}:   "reset-priority_" + plugin.PluginVersion + "_linux_amd64.zip",
+		{"linux", "arm64"}:   "reset-priority_" + plugin.PluginVersion + "_linux_arm64.zip",
+		{"darwin", "amd64"}:  "reset-priority_" + plugin.PluginVersion + "_darwin_amd64.zip",
+		{"darwin", "arm64"}:  "reset-priority_" + plugin.PluginVersion + "_darwin_arm64.zip",
+		{"windows", "amd64"}: "reset-priority_" + plugin.PluginVersion + "_windows_amd64.zip",
 	}
 	for platform, wantName := range want {
 		got, err := ArchiveName(plugin.PluginID, plugin.PluginVersion, platform[0], platform[1])

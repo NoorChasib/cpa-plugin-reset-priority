@@ -455,7 +455,7 @@ func TestManagementStatusPageRendersSanitizedHTML(t *testing.T) {
 	if cc := resp.Headers["Cache-Control"]; len(cc) == 0 || cc[0] != "no-store" {
 		t.Errorf("cache control = %v, want no-store", cc)
 	}
-	if csp := resp.Headers["Content-Security-Policy"]; len(csp) == 0 || !strings.Contains(csp[0], "frame-ancestors 'none'") {
+	if csp := resp.Headers["Content-Security-Policy"]; len(csp) == 0 || !strings.Contains(csp[0], "frame-ancestors 'self'") {
 		t.Errorf("content security policy = %v", csp)
 	}
 
