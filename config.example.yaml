@@ -42,6 +42,12 @@ plugins:
       # show the expected ordering for every real account.
       dry-run: true
 
+      # Time zone for timestamps on the HTML status view only. Accepts an IANA
+      # name such as America/Los_Angeles or Europe/Berlin, or "local" for the
+      # CPA host zone. Unknown names fall back to UTC with a status warning.
+      # The JSON status route always reports RFC3339 UTC.
+      display-timezone: UTC
+
       # v0.1.0 does not perform active Codex reset-window activation. Setting
       # this true is accepted but ignored with a warning; passive reads/retries
       # remain enabled.

@@ -276,6 +276,48 @@ func TestParseCodexActivationIgnoredWithWarning(t *testing.T) {
 	}
 }
 
+func TestParseDisplayTimezone(t *testing.T) {
+	cfg, err := Parse([]byte("enabled: true\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.DisplayTimezone != "UTC" || cfg.DisplayLocation() != time.UTC {
+		t.Errorf("default display timezone = %q, want UTC", cfg.DisplayTimezone)
+	}
+
+	cfg, err = Parse([]byte("enabled: true\ndisplay-timezone: America/Los_Angeles\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.DisplayTimezone != "America/Los_Angeles" || cfg.DisplayLocation().String() != "America/Los_Angeles" {
+		t.Errorf("display timezone = %q / %s", cfg.DisplayTimezone, cfg.DisplayLocation())
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("warnings = %v, want none", cfg.Warnings)
+	}
+
+	cfg, err = Parse([]byte("enabled: true\ndisplay-timezone: local\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.DisplayTimezone != "Local" || cfg.DisplayLocation() != time.Local {
+		t.Errorf("local display timezone = %q", cfg.DisplayTimezone)
+	}
+
+	// An unknown zone is presentation-only, so it degrades to UTC with a
+	// warning instead of rejecting the whole configuration.
+	cfg, err = Parse([]byte("enabled: true\ndisplay-timezone: Mars/Olympus_Mons\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.DisplayTimezone != "UTC" {
+		t.Errorf("unknown zone display timezone = %q, want UTC", cfg.DisplayTimezone)
+	}
+	if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], "Mars/Olympus_Mons") {
+		t.Errorf("warnings = %v, want an unknown-zone warning", cfg.Warnings)
+	}
+}
+
 func TestParseUnknownFieldsIgnored(t *testing.T) {
 	cfg, err := Parse([]byte("enabled: true\nfuture-option: whatever\nstore:\n  version: 1.2.3\n"))
 	if err != nil {

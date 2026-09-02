@@ -22,7 +22,7 @@ import (
 const (
 	PluginID      = "reset-priority"
 	PluginName    = "Reset Priority"
-	PluginVersion = "0.1.2"
+	PluginVersion = "0.1.3"
 	PluginAuthor  = "NoorChasib"
 	PluginRepo    = "https://github.com/NoorChasib/cpa-plugin-reset-priority"
 )
@@ -437,6 +437,7 @@ func configFields() []hostapi.ConfigField {
 		{Name: "manage-claude", Type: "boolean", Description: "Manage Claude OAuth credentials (default true)."},
 		{Name: "manage-codex", Type: "boolean", Description: "Manage Codex OAuth credentials (default true)."},
 		{Name: "dry-run", Type: "boolean", Description: "Compute and report priorities without writing auth files (default false; recommended true for first install)."},
+		{Name: "display-timezone", Type: "string", Description: "IANA time zone for timestamps on the HTML status view, e.g. America/Los_Angeles, or \"local\" for the host zone (default UTC). Presentation only."},
 	}
 }
 

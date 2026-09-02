@@ -506,10 +506,11 @@ func TestManagementStatusPageRendersSanitizedHTML(t *testing.T) {
 		"<h2>claude</h2>",
 		"<code>a.json</code>",
 		"<code>b.json</code>",
-		"<td>200</td>", // desired priority of the earliest-reset account
+		`<span class="desired">200</span>`, // desired priority of the earliest-reset account
 		"confirmed",
-		"Next reconcile:",
-		"Next reset deadline:",
+		"Next reconcile",
+		"Next reset deadline",
+		"Times shown in UTC",
 		`id="refresh-now"`,
 		"Refresh now",
 		"POST /v0/management/plugins/reset-priority/refresh",
@@ -521,12 +522,21 @@ func TestManagementStatusPageRendersSanitizedHTML(t *testing.T) {
 		}
 	}
 
-	// Exact reset timestamps and per-account fields come from the snapshot;
-	// the account label (an email in this fixture) must never be rendered.
+	// Exact reset timestamps are preserved on the <time> element and shown in
+	// the readable display form; the account label (an email in this
+	// fixture) must never be rendered.
 	for _, group := range snap.Providers {
 		for _, account := range group.Accounts {
-			if account.ResetAtUTC == "" || !strings.Contains(page, account.ResetAtUTC) {
-				t.Errorf("status page missing reset timestamp %q", account.ResetAtUTC)
+			if account.ResetAtUTC == "" || !strings.Contains(page, `datetime="`+account.ResetAtUTC+`"`) {
+				t.Errorf("status page missing exact reset timestamp %q", account.ResetAtUTC)
+			}
+			resetAt, errParse := time.Parse(time.RFC3339Nano, account.ResetAtUTC)
+			if errParse != nil {
+				t.Fatalf("fixture reset timestamp %q: %v", account.ResetAtUTC, errParse)
+			}
+			readable := `<span class="d">` + resetAt.UTC().Format(displayDateLayout) + `</span> - <span class="t">` + resetAt.UTC().Format(displayClockLayout) + `</span>`
+			if !strings.Contains(page, readable) {
+				t.Errorf("status page missing readable reset timestamp %q", readable)
 			}
 			if account.Label == "" {
 				t.Fatalf("test fixture lost its email label")
@@ -634,9 +644,100 @@ func TestRenderManagementStatusPageEscapesHTMLAndRedactsIdentifiers(t *testing.T
 	if strings.Contains(page, "idx-0123456789abcdef") {
 		t.Errorf("complete auth index rendered without redaction")
 	}
-	if !strings.Contains(page, "<td>unknown</td>") {
+	if !strings.Contains(page, `<span class="current">unknown</span>`) {
 		t.Errorf("missing current priority placeholder for unknown physical priority")
 	}
+}
+
+func TestRenderManagementStatusPageUsesDisplayTimezone(t *testing.T) {
+	// 2026-09-02T01:25:36Z is Tue Sep 1 2026 6:25:36 PM in Los Angeles (PDT).
+	generated := time.Date(2026, 9, 2, 1, 25, 36, 804808364, time.UTC)
+	deadline := generated.Add(8*time.Hour + 34*time.Minute + 23*time.Second)
+	current := 100
+	snap := engine.Snapshot{
+		GeneratedAt:     generated,
+		DisplayTimezone: "America/Los_Angeles",
+		NextDeadlineAt:  &deadline,
+		Providers: []engine.ProviderGroup{{
+			Provider: "claude",
+			Accounts: []engine.AccountStatus{{
+				Name:            "a.json",
+				Health:          "healthy",
+				ResetState:      "confirmed",
+				ResetAtUTC:      deadline.Format(time.RFC3339Nano),
+				CurrentPriority: &current,
+				DesiredPriority: 100,
+				LastSuccessAt:   generated.Format(time.RFC3339Nano),
+			}},
+		}},
+	}
+	raw, err := renderManagementStatusPage(snap)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	page := string(raw)
+	for _, marker := range []string{
+		`<span class="d">Tue Sep 1 2026</span> - <span class="t">6:25:36 PM PDT</span>`, // generated, in display zone
+		`<span class="d">Wed Sep 2 2026</span> - <span class="t">2:59:59 AM PDT</span>`, // deadline / reset, in display zone
+		`datetime="2026-09-02T01:25:36.804808364Z"`,                                     // exact UTC instant kept
+		"Times shown in America/Los_Angeles",
+		"in 8h 34m", // relative hint for the deadline
+		`<span class="pill ok">healthy</span>`,
+		`<span class="pill ok">confirmed</span>`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Errorf("status page missing %q", marker)
+		}
+	}
+	// The raw RFC3339 string must not appear as visible cell text.
+	if strings.Contains(page, ">2026-09-02T01:25:36.804808364Z<") {
+		t.Errorf("raw RFC3339 timestamp rendered as visible text")
+	}
+
+	// Unknown zone names degrade to UTC rather than failing the render.
+	snap.DisplayTimezone = "Mars/Olympus_Mons"
+	raw, err = renderManagementStatusPage(snap)
+	if err != nil {
+		t.Fatalf("render with unknown zone: %v", err)
+	}
+	if !strings.Contains(string(raw), `<span class="d">Wed Sep 2 2026</span> - <span class="t">1:25:36 AM UTC</span>`) {
+		t.Errorf("unknown display zone did not fall back to UTC")
+	}
+}
+
+func TestManagementStatusPageHonoursConfiguredTimezone(t *testing.T) {
+	caller := newFakeHostCaller()
+	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+	rt := newTestRuntime(t, caller)
+	registerRuntime(t, rt, "enabled: true\ndisplay-timezone: America/New_York\n")
+
+	snap := statusSnapshot(t, rt)
+	if snap.DisplayTimezone != "America/New_York" {
+		t.Errorf("snapshot display_timezone = %q", snap.DisplayTimezone)
+	}
+	// JSON timestamps stay RFC3339 UTC regardless of the display zone.
+	if snap.NextDeadlineAt == nil || snap.NextDeadlineAt.Location() != time.UTC {
+		t.Errorf("JSON deadline is not UTC: %v", snap.NextDeadlineAt)
+	}
+
+	resp := managementCall(t, rt, "GET", "/v0/management/plugins/reset-priority/status/html", nil)
+	page := string(resp.Body)
+	want := testBase.Add(48 * time.Hour).In(mustLoadLocation(t, "America/New_York")).Format(displayClockLayout)
+	if !strings.Contains(page, `<span class="t">`+want+`</span>`) {
+		t.Errorf("status page missing New York deadline %q", want)
+	}
+	if !strings.Contains(page, "Times shown in America/New_York") {
+		t.Errorf("status page missing display zone label")
+	}
+}
+
+func mustLoadLocation(t *testing.T, name string) *time.Location {
+	t.Helper()
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		t.Fatalf("load location %s: %v", name, err)
+	}
+	return loc
 }
 
 func TestManagementStatusPagePathOnResourceRouteStaysStatic(t *testing.T) {

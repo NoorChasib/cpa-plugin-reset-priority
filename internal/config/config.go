@@ -22,6 +22,10 @@ const (
 	DefaultPriorityFloor      = 100
 	DefaultPriorityStep       = 100
 	DefaultQuarantinePriority = 0
+	// DefaultDisplayTimezone is the IANA zone used to render timestamps on
+	// the management HTML status view. It never affects ranking or the JSON
+	// status route, which stay in RFC3339 UTC.
+	DefaultDisplayTimezone = "UTC"
 )
 
 // Provider IDs managed by this plugin.
@@ -55,6 +59,9 @@ type Config struct {
 	// DryRun computes and reports desired priorities but never calls
 	// host.auth.save.
 	DryRun bool
+	// DisplayTimezone is the validated IANA zone name (or "Local") used only
+	// for human-readable timestamps on the management HTML view.
+	DisplayTimezone string
 	// Warnings carries sanitized, non-fatal parse notes for status display.
 	Warnings []string
 }
@@ -88,6 +95,7 @@ type rawConfig struct {
 	ManageCodex       *bool      `yaml:"manage-codex"`
 	Providers         *[]string  `yaml:"providers"` // alias for manage-*
 	DryRun            *bool      `yaml:"dry-run"`
+	DisplayTimezone   *string    `yaml:"display-timezone"`
 	// codex-reset-window-activation is a documented phase-2 option. v0.1.0
 	// deliberately does not implement active Codex reset-window activation
 	// (it can consume quota); a true value is accepted but ignored with a
@@ -165,6 +173,7 @@ func Parse(configYAML []byte) (Config, error) {
 		ManageClaude:       true,
 		ManageCodex:        true,
 		DryRun:             false,
+		DisplayTimezone:    DefaultDisplayTimezone,
 	}
 	trimmed := strings.TrimSpace(string(configYAML))
 	if trimmed == "" {
@@ -220,6 +229,13 @@ func Parse(configYAML []byte) (Config, error) {
 	if raw.DryRun != nil {
 		cfg.DryRun = *raw.DryRun
 	}
+	if raw.DisplayTimezone != nil {
+		name, warning := resolveDisplayTimezone(*raw.DisplayTimezone)
+		cfg.DisplayTimezone = name
+		if warning != "" {
+			cfg.Warnings = append(cfg.Warnings, warning)
+		}
+	}
 	if raw.CodexActivation != nil && *raw.CodexActivation {
 		cfg.Warnings = append(cfg.Warnings,
 			"codex-reset-window-activation is not implemented in v0.1.0 and is ignored; accounts in awaiting_new_window recover via passive re-reads only")
@@ -229,6 +245,48 @@ func Parse(configYAML []byte) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// resolveDisplayTimezone validates a display-timezone value. It accepts IANA
+// names ("America/Los_Angeles"), "UTC", and "local" (the host process zone).
+// Because the zone only affects presentation, an unknown name degrades to
+// UTC with a status warning instead of rejecting the whole configuration.
+func resolveDisplayTimezone(value string) (string, string) {
+	trimmed := strings.TrimSpace(value)
+	switch strings.ToLower(trimmed) {
+	case "", "utc", "z":
+		return DefaultDisplayTimezone, ""
+	case "local":
+		return "Local", ""
+	}
+	loc, err := time.LoadLocation(trimmed)
+	if err != nil {
+		return DefaultDisplayTimezone, fmt.Sprintf(
+			"display-timezone %q is not a known IANA zone; timestamps are shown in UTC", trimmed)
+	}
+	return loc.String(), ""
+}
+
+// DisplayLocation returns the *time.Location for DisplayTimezone, falling
+// back to UTC when the name is empty or cannot be loaded.
+func (c Config) DisplayLocation() *time.Location {
+	return LoadDisplayLocation(c.DisplayTimezone)
+}
+
+// LoadDisplayLocation resolves a validated display zone name to a location,
+// treating any failure as UTC so rendering never fails on presentation input.
+func LoadDisplayLocation(name string) *time.Location {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "utc", "z":
+		return time.UTC
+	case "local":
+		return time.Local
+	}
+	loc, err := time.LoadLocation(strings.TrimSpace(name))
+	if err != nil {
+		return time.UTC
+	}
+	return loc
 }
 
 func validate(cfg Config) error {

@@ -10,5 +10,9 @@
 // The library basename defines the plugin ID: reset-priority.
 package main
 
+// The embedded tzdata copy lets display-timezone resolve IANA zone names
+// even when the host container image ships without /usr/share/zoneinfo.
+import _ "time/tzdata"
+
 // main is required by buildmode=c-shared; the host never calls it.
 func main() {}

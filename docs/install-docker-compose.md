@@ -67,6 +67,7 @@ plugins:
       manage-codex: true
 
       dry-run: true
+      display-timezone: UTC # HTML status view timestamps; e.g. America/Los_Angeles
 ```
 
 If the existing config already has `plugins`, merge the nested keys. YAML cannot contain two sibling `plugins:` mappings.

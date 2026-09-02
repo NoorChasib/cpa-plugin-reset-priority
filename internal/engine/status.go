@@ -11,10 +11,13 @@ import (
 // Snapshot is the published, sanitized status. It never contains tokens,
 // auth JSON, or raw provider responses.
 type Snapshot struct {
-	GeneratedAt     time.Time       `json:"generated_at"`
-	DryRun          bool            `json:"dry_run"`
-	Enabled         bool            `json:"enabled"`
-	Stopped         bool            `json:"stopped"`
+	GeneratedAt time.Time `json:"generated_at"`
+	DryRun      bool      `json:"dry_run"`
+	Enabled     bool      `json:"enabled"`
+	Stopped     bool      `json:"stopped"`
+	// DisplayTimezone is the operator-chosen presentation zone for the HTML
+	// view. All timestamps in this JSON stay RFC3339 UTC regardless.
+	DisplayTimezone string          `json:"display_timezone,omitempty"`
 	Warnings        []string        `json:"warnings,omitempty"`
 	RosterError     string          `json:"roster_error,omitempty"`
 	NextReconcileAt *time.Time      `json:"next_reconcile_at,omitempty"`
@@ -52,12 +55,13 @@ type AccountStatus struct {
 // publishStatusLocked rebuilds the published snapshot. Caller holds e.mu.
 func (e *Engine) publishStatusLocked(now time.Time) {
 	snap := Snapshot{
-		GeneratedAt: now,
-		DryRun:      e.cfg.DryRun,
-		Enabled:     e.cfg.Enabled,
-		Stopped:     e.stopped,
-		Warnings:    append([]string(nil), e.cfg.Warnings...),
-		RosterError: e.lastRosterError,
+		GeneratedAt:     now,
+		DryRun:          e.cfg.DryRun,
+		Enabled:         e.cfg.Enabled,
+		Stopped:         e.stopped,
+		DisplayTimezone: e.cfg.DisplayTimezone,
+		Warnings:        append([]string(nil), e.cfg.Warnings...),
+		RosterError:     e.lastRosterError,
 	}
 	if !e.nextReconcileAt.IsZero() {
 		t := e.nextReconcileAt

@@ -120,6 +120,7 @@ plugins:
       manage-claude: true
       manage-codex: true
       dry-run: true
+      display-timezone: UTC # HTML status view timestamps; e.g. America/Los_Angeles
 ```
 
 Restart/reload CPA when required. Then:
