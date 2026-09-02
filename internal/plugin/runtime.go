@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -22,7 +23,7 @@ import (
 const (
 	PluginID      = "reset-priority"
 	PluginName    = "Reset Priority"
-	PluginVersion = "0.1.3"
+	PluginVersion = "0.1.4"
 	PluginAuthor  = "NoorChasib"
 	PluginRepo    = "https://github.com/NoorChasib/cpa-plugin-reset-priority"
 )
@@ -326,7 +327,7 @@ func (r *Runtime) handleManagement(request []byte) []byte {
 		if !refreshRequestAllowed(req.Headers) {
 			return okEnvelope(jsonResponse(403, map[string]string{
 				"status": "forbidden",
-				"detail": "refresh requires the plugin CSRF request header and same-origin browser metadata",
+				"detail": "refresh requires the plugin CSRF request header and, from a browser, same-origin fetch metadata or a plain-HTTP same-origin page",
 			}))
 		}
 		ctx := hostapi.WithHostCallbackID(context.Background(), req.HostCallbackID)
@@ -353,6 +354,26 @@ func (r *Runtime) handleManagement(request []byte) []byte {
 	}
 }
 
+// refreshRequestAllowed gates the mutating refresh route.
+//
+// The plugin CSRF header is always required. It makes the request non-simple,
+// so a cross-origin HTML form cannot submit it, and it forces a CORS preflight,
+// which browsers refuse to send with credentials against CPA's wildcard
+// Access-Control-Allow-Origin.
+//
+// Browsers attach Fetch Metadata (Sec-Fetch-Site) only when the request URL is
+// potentially trustworthy: https, or a loopback host. When present it is
+// authoritative and only same-origin and navigation ("none") are accepted.
+//
+// When CPA is reached over plain HTTP on any other host, even a current browser
+// sends no fetch metadata, so Origin is the only browser-controlled signal
+// left. An http:// Origin is consistent with the legitimate status page: a
+// browser can only post to a plain-HTTP server from a plain-HTTP page, because
+// mixed-content blocking stops https pages from fetching http URLs. It is
+// accepted. An https://, "null", or malformed Origin without fetch metadata
+// cannot come from a supported browser talking to this route and is rejected.
+// Requests carrying neither Origin nor fetch metadata are non-browser
+// management clients and are accepted.
 func refreshRequestAllowed(headers map[string][]string) bool {
 	if !headerHasToken(headers, refreshRequestHeader, refreshRequestHeaderValue) {
 		return false
@@ -371,10 +392,31 @@ func refreshRequestAllowed(headers map[string][]string) bool {
 		return true
 	}
 
-	// Non-browser management clients normally send neither Origin nor fetch
-	// metadata. If Origin is present, fail closed unless the browser also supplied
-	// an explicitly allowed Sec-Fetch-Site value above.
-	return !headerPresent(headers, "Origin")
+	origins, hasOrigin := headerTokens(headers, "Origin")
+	if !hasOrigin {
+		return true
+	}
+	if len(origins) != 1 {
+		return false
+	}
+	return isPlainHTTPOrigin(origins[0])
+}
+
+// isPlainHTTPOrigin reports whether value is a well-formed http:// origin
+// (scheme and host only). Browsers omit fetch metadata for requests to such
+// origins, so this is the shape a legitimate plain-HTTP status page produces.
+func isPlainHTTPOrigin(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Scheme, "http") &&
+		parsed.Host != "" &&
+		parsed.User == nil &&
+		parsed.Path == "" &&
+		parsed.RawQuery == "" &&
+		parsed.Fragment == "" &&
+		!parsed.ForceQuery
 }
 
 func headerHasToken(headers map[string][]string, name, token string) bool {
@@ -410,15 +452,6 @@ func headerTokens(headers map[string][]string, name string) ([]string, bool) {
 		}
 	}
 	return tokens, present
-}
-
-func headerPresent(headers map[string][]string, name string) bool {
-	for key := range headers {
-		if strings.EqualFold(strings.TrimSpace(key), name) {
-			return true
-		}
-	}
-	return false
 }
 
 func isResourcePath(path string) bool {

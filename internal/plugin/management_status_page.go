@@ -280,8 +280,17 @@ time .d,time .t{white-space:nowrap}
 					location.reload();
 					return;
 				}
-				result.textContent = "Refresh failed: HTTP " + resp.status;
-				button.disabled = false;
+				return resp.text().then(function (text) {
+					var detail = "";
+					try {
+						var parsed = JSON.parse(text);
+						if (parsed && typeof parsed.detail === "string") {
+							detail = parsed.detail;
+						}
+					} catch (ignored) {}
+					result.textContent = "Refresh failed: HTTP " + resp.status + (detail ? ": " + detail : "");
+					button.disabled = false;
+				});
 			})
 			.catch(function () {
 				result.textContent = "Refresh failed: network error";

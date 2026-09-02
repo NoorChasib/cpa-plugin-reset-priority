@@ -255,21 +255,87 @@ func TestManagementRefreshRejectsSameSiteSiblingOrigin(t *testing.T) {
 	}
 }
 
-func TestManagementRefreshRejectsBrowserOriginWithoutFetchMetadata(t *testing.T) {
+func TestManagementRefreshRejectsNonPlainHTTPOriginWithoutFetchMetadata(t *testing.T) {
+	// Without fetch metadata, only an http:// origin can be a legitimate
+	// browser page (mixed-content blocking keeps https pages away from a
+	// plain-HTTP server, and https or loopback targets always carry
+	// Sec-Fetch-Site). Everything else fails closed.
+	for _, origin := range []string{
+		"https://unknown-origin.example",
+		"null",
+		"",
+		"http://",
+		"http://user:pw@cpa.example:8317",
+		"http://cpa.example:8317/path",
+		"http://cpa.example:8317?q=1",
+		"ftp://cpa.example",
+		"http://a.example, http://b.example",
+	} {
+		t.Run(origin, func(t *testing.T) {
+			caller := newFakeHostCaller()
+			caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+			rt := newTestRuntime(t, caller)
+			registerRuntime(t, rt, "enabled: true\n")
+			before := caller.httpCallCount()
+
+			resp := refreshCall(t, rt, map[string][]string{
+				"Origin": {origin},
+			}, "")
+			if resp.StatusCode != 403 {
+				t.Fatalf("origin %q without fetch metadata = %d, want 403", origin, resp.StatusCode)
+			}
+			if caller.httpCallCount() != before {
+				t.Fatalf("origin %q without fetch metadata triggered provider traffic", origin)
+			}
+		})
+	}
+}
+
+func TestManagementRefreshAllowsPlainHTTPSameOriginPageWithoutFetchMetadata(t *testing.T) {
+	// Exact header shape captured from a current Chromium posting from the
+	// status page to CPA served over plain HTTP on a non-loopback host: the
+	// browser sends Origin but no Sec-Fetch-* headers at all.
+	for _, origin := range []string{
+		"http://vps-code.example.ts.net:8317",
+		"http://192.0.2.10:8317",
+		"HTTP://CPA.EXAMPLE",
+	} {
+		t.Run(origin, func(t *testing.T) {
+			caller := newFakeHostCaller()
+			caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
+			rt := newTestRuntime(t, caller)
+			registerRuntime(t, rt, "enabled: true\n")
+
+			resp := refreshCall(t, rt, map[string][]string{
+				"Origin":         {origin},
+				"Content-Length": {"0"},
+				"Accept":         {"*/*"},
+			}, "")
+			if resp.StatusCode != 200 {
+				t.Fatalf("plain-HTTP same-origin refresh = %d %s, want 200", resp.StatusCode, resp.Body)
+			}
+			if !strings.Contains(string(resp.Body), `"status":"ok"`) {
+				t.Fatalf("plain-HTTP same-origin refresh body = %s", resp.Body)
+			}
+		})
+	}
+
+	// The CSRF header is still mandatory on that path.
 	caller := newFakeHostCaller()
 	caller.addClaudeAccount("a", testBase.Add(48*time.Hour))
 	rt := newTestRuntime(t, caller)
 	registerRuntime(t, rt, "enabled: true\n")
 	before := caller.httpCallCount()
-
-	resp := refreshCall(t, rt, map[string][]string{
-		"Origin": {"https://unknown-origin.example"},
-	}, "")
+	resp := managementRequest(t, rt, hostapi.ManagementRequest{
+		Method:  "POST",
+		Path:    "/v0/management/plugins/reset-priority/refresh",
+		Headers: map[string][]string{"Origin": {"http://cpa.example:8317"}},
+	})
 	if resp.StatusCode != 403 {
-		t.Fatalf("origin without fetch metadata = %d, want 403", resp.StatusCode)
+		t.Fatalf("plain-HTTP origin without CSRF header = %d, want 403", resp.StatusCode)
 	}
 	if caller.httpCallCount() != before {
-		t.Fatalf("origin without fetch metadata triggered provider traffic")
+		t.Fatalf("plain-HTTP origin without CSRF header triggered provider traffic")
 	}
 }
 
@@ -516,6 +582,7 @@ func TestManagementStatusPageRendersSanitizedHTML(t *testing.T) {
 		"POST /v0/management/plugins/reset-priority/refresh",
 		`method: "POST"`,
 		`"X-Reset-Priority-Refresh": "1"`,
+		`parsed.detail`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Errorf("management status page missing %q", marker)
